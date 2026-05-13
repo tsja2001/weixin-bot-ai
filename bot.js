@@ -6,6 +6,7 @@ import mammoth from "mammoth";
 // ========== 常量 ==========
 const BASE_URL = "https://ilinkai.weixin.qq.com";
 const CONFIG_FILE = "config.json";
+const SESSION_FILE = "session.json";
 const DEBUG_LOG_FILE = "logs/debug_messages.jsonl";
 const DEFAULT_PROMPT = "你是一个有帮助的AI助手，请用中文简洁地回复。字数尽量少一些";
 
@@ -74,6 +75,33 @@ function summarizeMsg(msg) {
 function maskKey(key) {
   if (key.length <= 10) return key;
   return key.slice(0, 5) + "*".repeat(key.length - 10) + key.slice(-5);
+}
+
+function saveSession() {
+  try {
+    fs.writeFileSync(SESSION_FILE, JSON.stringify({
+      botToken, botBaseUrl, loginTime, getUpdatesBuf
+    }), "utf-8");
+    console.log("[Session] 已保存登录态");
+  } catch (e) {
+    console.log("[Session] 保存失败:", e.message);
+  }
+}
+
+function loadSession() {
+  try {
+    if (!fs.existsSync(SESSION_FILE)) return null;
+    const raw = fs.readFileSync(SESSION_FILE, "utf-8");
+    const s = JSON.parse(raw);
+    if (!s.botToken || !s.loginTime) throw new Error("session 字段缺失");
+    console.log("[Session] 从文件恢复: loginTime=%s, baseUrl=%s",
+      new Date(s.loginTime).toISOString(), s.botBaseUrl);
+    return s;
+  } catch (e) {
+    console.log("[Session] 读取失败(%s)，将走扫码流程", e.message);
+    try { fs.unlinkSync(SESSION_FILE); } catch {}
+    return null;
+  }
 }
 
 function rlQuestion(rl, q) {
@@ -487,6 +515,7 @@ async function doReconnect() {
 
   reconnectInProgress = false;
   loginTime = Date.now();
+  saveSession();
 }
 
 async function reconnectTimerLoop() {
@@ -855,49 +884,61 @@ console.log(`
 // 0. 加载配置文件
 const botConfig = await loadOrCreateConfig();
 
-// 1. 获取登录二维码
-const { qrcode, qrcode_img_content } = await fetch(
-  `${BASE_URL}/ilink/bot/get_bot_qrcode?bot_type=3`
-).then(r => r.json());
-
-if (qrcode_img_content) {
-  const content = String(qrcode_img_content);
-  if (content.startsWith("data:image/")) {
-    const [header, b64] = content.split(",");
-    const ext = header.match(/data:image\/(\w+)/)?.[1] ?? "png";
-    fs.writeFileSync(`qrcode.${ext}`, Buffer.from(b64, "base64"));
-    console.log(`二维码已保存到 qrcode.${ext}`);
-  } else if (content.startsWith("http")) {
-    console.log("二维码图片地址:", content);
-    console.log("请将图片地址发送给文件传输助手，然后用手机端微信打开链接进行连接！！！");
-  } else if (content.startsWith("<svg")) {
-    fs.writeFileSync("qrcode.svg", content);
-    console.log("二维码已保存到 qrcode.svg，用浏览器打开");
-  } else {
-    fs.writeFileSync("qrcode.png", Buffer.from(content, "base64"));
-    console.log("二维码已保存到 qrcode.png");
-  }
-}
-
-// 2. 等待扫码确认
-console.log("等待扫码...");
-while (true) {
-  const status = await fetch(
-    `${BASE_URL}/ilink/bot/get_qrcode_status?qrcode=${qrcode}`
+// 1. 尝试恢复登录态，有效则跳过扫码
+const savedSession = loadSession();
+if (savedSession) {
+  botToken = savedSession.botToken;
+  botBaseUrl = savedSession.botBaseUrl;
+  loginTime = savedSession.loginTime;
+  getUpdatesBuf = savedSession.getUpdatesBuf ?? "";
+  console.log("[Session] 登录态有效，跳过扫码直接启动");
+} else {
+  // 2. 获取登录二维码
+  const { qrcode, qrcode_img_content } = await fetch(
+    `${BASE_URL}/ilink/bot/get_bot_qrcode?bot_type=3`
   ).then(r => r.json());
 
-  if (status.status === "confirmed") {
-    botToken = status.bot_token;
-    botBaseUrl = status.baseurl ?? BASE_URL;
-    console.log("登录成功！");
-    console.log("=".repeat(40));
-    console.log(COMMANDS_MSG);
-    console.log("=".repeat(40));
-    break;
+  if (qrcode_img_content) {
+    const content = String(qrcode_img_content);
+    if (content.startsWith("data:image/")) {
+      const [header, b64] = content.split(",");
+      const ext = header.match(/data:image\/(\w+)/)?.[1] ?? "png";
+      fs.writeFileSync(`qrcode.${ext}`, Buffer.from(b64, "base64"));
+      console.log(`二维码已保存到 qrcode.${ext}`);
+    } else if (content.startsWith("http")) {
+      console.log("二维码图片地址:", content);
+      console.log("请将图片地址发送给文件传输助手，然后用手机端微信打开链接进行连接！！！");
+    } else if (content.startsWith("<svg")) {
+      fs.writeFileSync("qrcode.svg", content);
+      console.log("二维码已保存到 qrcode.svg，用浏览器打开");
+    } else {
+      fs.writeFileSync("qrcode.png", Buffer.from(content, "base64"));
+      console.log("二维码已保存到 qrcode.png");
+    }
   }
-  await sleep(1000);
+
+  // 3. 等待扫码确认
+  console.log("等待扫码...");
+  while (true) {
+    const status = await fetch(
+      `${BASE_URL}/ilink/bot/get_qrcode_status?qrcode=${qrcode}`
+    ).then(r => r.json());
+
+    if (status.status === "confirmed") {
+      botToken = status.bot_token;
+      botBaseUrl = status.baseurl ?? BASE_URL;
+      loginTime = Date.now();
+      saveSession();
+      console.log("登录成功！");
+      console.log("=".repeat(40));
+      console.log(COMMANDS_MSG);
+      console.log("=".repeat(40));
+      break;
+    }
+    await sleep(1000);
+  }
 }
 
-// 3. 并发启动消息循环 + 定时器循环
-loginTime = Date.now();
+// 4. 并发启动消息循环 + 重连定时器 + 调度器
+if (!loginTime) loginTime = Date.now();
 await Promise.all([messageLoop(), reconnectTimerLoop(), schedulerLoop()]);

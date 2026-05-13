@@ -1,6 +1,8 @@
 # 配置文件（含 API key，绝不可提交）
 config.json
-config copy.json
+session.json
+instances/*/config.json
+instances/*/session.json
 
 # Claude Code 本地设置（含 token）
 .claude/settings.local.json
@@ -10,6 +12,7 @@ node_modules/
 
 # 日志
 logs/
+instances/*/logs/
 
 # 微信登录二维码
 qrcode.*
