@@ -37,7 +37,8 @@ const HISTORY_MAX_TURNS = 10;           // 保留最近 N 轮对话
 const HISTORY_TTL_MS = 60 * 60 * 1000;  // 无活动多久后清空（毫秒）
 const HISTORY_MAX_CONTENT_LEN = 2000;   // 历史中单条消息最大字数
 const PDF_TEXT_MIN_CHARS = 200;         // 超过此长度优先使用 PDF 文本层，避免文本 PDF 误走 OCR
-const PDF_OCR_RENDER_SCALE = 1.35;      // 多页扫描件 OCR 渲染倍率，控制识别速度和内存
+const PDF_OCR_RENDER_SCALE = parsePositiveNumberEnv("PDF_OCR_RENDER_SCALE", 1.35); // 多页扫描件 OCR 渲染倍率
+const PDF_OCR_PAGE_CONCURRENCY = parseIntRangeEnv("PDF_OCR_PAGE_CONCURRENCY", 1, 1, 2); // 多页 OCR 页级并发
 const APP_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PDFJS_WASM_URL = pathToFileURL(path.join(APP_DIR, "node_modules/pdfjs-dist/wasm")).href + "/";
 
@@ -64,6 +65,28 @@ function resetStatsIfNewDay() {
 
 // ========== 工具函数 ==========
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+function parsePositiveNumberEnv(name, defaultValue) {
+  const raw = process.env[name];
+  if (!raw) return defaultValue;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    console.log(`[配置] ${name}=${raw} 无效，使用默认值 ${defaultValue}`);
+    return defaultValue;
+  }
+  return value;
+}
+
+function parseIntRangeEnv(name, defaultValue, min, max) {
+  const raw = process.env[name];
+  if (!raw) return defaultValue;
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isInteger(value) || value < min || value > max) {
+    console.log(`[配置] ${name}=${raw} 无效，使用默认值 ${defaultValue}`);
+    return defaultValue;
+  }
+  return value;
+}
 
 function debugLog(entry) {
   const line = JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n";
@@ -279,6 +302,22 @@ async function renderPdfPageToPng(page, scale) {
   return canvas.toBuffer("image/png");
 }
 
+async function mapWithConcurrency(items, concurrency, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function runWorker() {
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      results[index] = await worker(items[index], index);
+    }
+  }
+
+  const workerCount = Math.min(concurrency, items.length);
+  await Promise.all(Array.from({ length: workerCount }, runWorker));
+  return results;
+}
+
 async function extractFromPdf(buffer) {
   const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
   // Buffer extends Uint8Array in Node.js, so instanceof alone doesn't guard.
@@ -318,15 +357,19 @@ async function extractFromPdf(buffer) {
 
   let pages;
   try {
-    pages = [];
-    for (let i = 1; i <= pageCount; i++) {
-      const page = await doc.getPage(i);
-      const pngBuffer = await renderPdfPageToPng(page, PDF_OCR_RENDER_SCALE);
-      console.log(`[PDF] 第 ${i}/${pageCount} 页渲染完成: ${(pngBuffer.length / 1024).toFixed(1)}KB，开始 OCR...`);
-      const pageResult = await ocrImage(pngBuffer, i);
-      pages.push(pageResult);
-      console.log(`[PDF] 第 ${i}/${pageCount} 页 OCR 完成: ${pageResult.text.length} 字`);
-    }
+    console.log(`[PDF] 开始 OCR: renderScale=${PDF_OCR_RENDER_SCALE}, pageConcurrency=${PDF_OCR_PAGE_CONCURRENCY}`);
+    pages = await mapWithConcurrency(
+      Array.from({ length: pageCount }, (_, index) => index + 1),
+      PDF_OCR_PAGE_CONCURRENCY,
+      async (pageNo) => {
+        const page = await doc.getPage(pageNo);
+        const pngBuffer = await renderPdfPageToPng(page, PDF_OCR_RENDER_SCALE);
+        console.log(`[PDF] 第 ${pageNo}/${pageCount} 页渲染完成: ${(pngBuffer.length / 1024).toFixed(1)}KB，开始 OCR...`);
+        const pageResult = await ocrImage(pngBuffer, pageNo);
+        console.log(`[PDF] 第 ${pageNo}/${pageCount} 页 OCR 完成: ${pageResult.text.length} 字`);
+        return pageResult;
+      }
+    );
     console.log(`[PDF] OCR 完成，耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   } catch (e) {
     console.log(`[PDF] OCR 调用失败: ${e.message}`);

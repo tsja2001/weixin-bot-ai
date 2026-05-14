@@ -66,6 +66,40 @@ PDF_TEXT_MIN_CHARS   PDF 自动模式中文本层阈值，默认 200
 PDF_RENDER_SCALE     PDF OCR 渲染倍率，默认 1.35
 ```
 
+Python OCR 服务也支持 CPU 优化相关环境变量：
+
+```text
+OCR_USE_CLS           是否启用方向分类器，默认 true
+OCR_INTRA_THREADS     ONNXRuntime intra 线程数，默认 -1
+OCR_INTER_THREADS     ONNXRuntime inter 线程数，默认 -1
+OCR_REC_BATCH_NUM     文字识别 batch，默认 6
+OCR_CLS_BATCH_NUM     方向分类 batch，默认 6
+```
+
+这些变量需要在启动或重启 `ocr-service` 时生效，例如：
+
+```bash
+OCR_USE_CLS=false OCR_INTRA_THREADS=4 OCR_INTER_THREADS=1 OCR_REC_BATCH_NUM=12 pm2 restart ocr-service --update-env
+```
+
+主 bot 的 PDF OCR 参数：
+
+```text
+PDF_OCR_RENDER_SCALE      多页 PDF OCR 渲染倍率，默认 1.35
+PDF_OCR_PAGE_CONCURRENCY  多页 PDF OCR 页级并发，支持 1 或 2，默认 1
+```
+
+基准测试脚本：
+
+```bash
+cd /opt/weixin-bot-ai
+npm run ocr:benchmark -- --mode text-only --label text-smoke --runs 1
+npm run ocr:benchmark -- --mode auto --label baseline --warmups 1 --runs 3
+npm run ocr:benchmark -- --mode force-ocr --label baseline --warmups 1 --runs 3
+```
+
+报告会写入 `benchmarks/ocr/`，包含 JSONL 明细和 Markdown 汇总。
+
 ## 4. 页面测试模式
 
 页面左侧可以选择：

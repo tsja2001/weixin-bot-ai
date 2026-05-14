@@ -593,3 +593,42 @@ PDF_OCR_PAGE_CONCURRENCY=1
 
 是否启用页级并发 2，需要以基准测试结果为准。N100 核心数有限，盲目并发可能让单页耗时增加，总耗时未必下降。
 
+## 16. 已落地实现说明
+
+当前分支已按方案 A 增加以下能力：
+
+```text
+1. ocr-service/main.py 支持 OCR_USE_CLS、OCR_INTRA_THREADS、OCR_INTER_THREADS、
+   OCR_REC_BATCH_NUM、OCR_CLS_BATCH_NUM，并在 /health 返回配置快照和 providers。
+2. bot.js 支持 PDF_OCR_RENDER_SCALE、PDF_OCR_PAGE_CONCURRENCY。
+3. 新增 tools/ocr_benchmark.mjs，可输出 benchmarks/ocr/*.jsonl 和 *-summary.md。
+4. package.json 新增 npm run ocr:benchmark。
+```
+
+常用命令：
+
+```bash
+cd /opt/weixin-bot-ai
+npm run ocr:benchmark -- --mode text-only --label smoke-text --runs 1
+npm run ocr:benchmark -- --mode auto --label baseline --warmups 1 --runs 3
+npm run ocr:benchmark -- --mode force-ocr --label baseline --warmups 1 --runs 3
+```
+
+测试优化配置时，OCR 服务环境变量需要在启动或重启 `ocr-service` 时生效：
+
+```bash
+OCR_USE_CLS=false \
+OCR_INTRA_THREADS=4 \
+OCR_INTER_THREADS=1 \
+OCR_REC_BATCH_NUM=12 \
+OCR_CLS_BATCH_NUM=6 \
+pm2 restart ocr-service --update-env
+```
+
+随后用同一组 PDF 参数跑基准：
+
+```bash
+PDF_OCR_RENDER_SCALE=1.2 \
+PDF_OCR_PAGE_CONCURRENCY=1 \
+npm run ocr:benchmark -- --mode force-ocr --label scale-1.2 --warmups 1 --runs 3
+```
