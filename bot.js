@@ -159,7 +159,62 @@ function detectImageFormat(buf) {
   return null;
 }
 
-async function parseDocumentFile({ buffer, fileName }) {
+async function parseDocumentFile({ buffer, fileName }, onEvent) {
+  const documentServiceUrl = botConfig.document_service_url || DEFAULT_DOCUMENT_SERVICE_URL;
+  const res = await fetch(`${documentServiceUrl}/parse-stream`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/octet-stream",
+      "x-file-name": encodeURIComponent(fileName),
+    },
+    body: buffer,
+    signal: AbortSignal.timeout(10 * 60 * 1000),
+  });
+
+  if (!res.ok) {
+    if (res.status === 404) {
+      return parseDocumentFileLegacy({ buffer, fileName });
+    }
+    const text = await res.text().catch(() => "");
+    throw new Error(`文档解析服务返回 HTTP ${res.status}: ${text.slice(0, 300)}`);
+  }
+
+  const decoder = new TextDecoder();
+  let pending = "";
+  let finalResult = null;
+
+  for await (const chunk of res.body) {
+    pending += decoder.decode(chunk, { stream: true });
+    const lines = pending.split("\n");
+    pending = lines.pop() || "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const event = JSON.parse(line);
+      if (event.event === "result") {
+        finalResult = event;
+      } else if (event.event === "error") {
+        throw new Error(event.error || "文档解析失败");
+      } else {
+        await onEvent?.(event);
+      }
+    }
+  }
+
+  pending += decoder.decode();
+  if (pending.trim()) {
+    const event = JSON.parse(pending);
+    if (event.event === "result") finalResult = event;
+    else if (event.event === "error") throw new Error(event.error || "文档解析失败");
+    else await onEvent?.(event);
+  }
+
+  if (!finalResult) {
+    throw new Error("文档解析服务未返回结果");
+  }
+  return finalResult;
+}
+
+async function parseDocumentFileLegacy({ buffer, fileName }) {
   const documentServiceUrl = botConfig.document_service_url || DEFAULT_DOCUMENT_SERVICE_URL;
   const res = await fetch(`${documentServiceUrl}/parse`, {
     method: "POST",
@@ -781,16 +836,40 @@ async function messageLoop() {
           await sendMsgSafe(fromId, contextToken,
             `已收到「${fileItem.file_name}」，正在解析，请稍候...`);
 
-          const result = await parseDocumentFile(fileData);
+          let ocrProgressTimer = null;
+          let ocrPageCount = 0;
+          const ocrDonePages = new Set();
+          const clearOcrProgressTimer = () => {
+            if (ocrProgressTimer) {
+              clearTimeout(ocrProgressTimer);
+              ocrProgressTimer = null;
+            }
+          };
+
+          const result = await (async () => {
+            try {
+              return await parseDocumentFile(fileData, async event => {
+                if (event.type === "ocr_start") {
+                  ocrPageCount = event.pageCount || 0;
+                  await sendMsgSafe(fromId, contextToken, "需要OCR识别，请稍等。");
+                  clearOcrProgressTimer();
+                  ocrProgressTimer = setTimeout(() => {
+                    const done = ocrDonePages.size;
+                    const total = ocrPageCount || "?";
+                    sendMsgSafe(fromId, contextToken, `OCR进行中（${done}/${total}页），请稍候。`);
+                  }, 15000);
+                } else if (event.type === "ocr_page" && event.page) {
+                  ocrDonePages.add(event.page);
+                }
+              });
+            } finally {
+              clearOcrProgressTimer();
+            }
+          })();
           if (result.mode === "image") {
-            pendingFiles.set(fromId, {
-              type: "image",
-              fileName: fileItem.file_name,
-              images: result.images,
-              timestamp: Date.now(),
-            });
+            console.log("[文件] 文档服务返回了旧版图片模式，请重启 document-service");
             await sendMsgSafe(fromId, contextToken,
-              `已收到「${fileItem.file_name}」（${result.pageCount}页），已转换为图片，请告诉我您的要求。`);
+              `文档解析服务需要重启，请稍后再试。`);
           } else if (result.mode === "ocr_text") {
             if (result.text === "(未能识别出文字内容)") {
               await sendMsgSafe(fromId, contextToken,
@@ -819,7 +898,7 @@ async function messageLoop() {
             await sendMsgSafe(fromId, contextToken, reply);
           } else if (result.mode === "ocr_needed") {
             await sendMsgSafe(fromId, contextToken,
-              `已收到「${fileItem.file_name}」（${result.pageCount}页），超过3页的PDF识别功能暂未配置OCR服务。`);
+              `已收到「${fileItem.file_name}」（${result.pageCount}页），需要OCR，但OCR服务未配置。`);
           } else {
             await sendMsgSafe(fromId, contextToken,
               `[Bot] 收到文件 "${fileItem.file_name}"，但无法解析 .${result.type} 格式。目前支持: .docx, .txt, .pdf, .xlsx, .pptx`);

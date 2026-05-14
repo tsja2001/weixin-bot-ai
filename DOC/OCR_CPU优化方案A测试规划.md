@@ -67,7 +67,7 @@ RapidOCR 默认方向分类 batch：cls_batch_num=6
 1. 不换 rapidocr-openvino
 2. 不安装 onnxruntime-openvino
 3. 不启用 Intel 核显
-4. 不改变 3 页以内 PDF 走 AI vision 的策略
+4. 不改变图片消息走 AI vision 的策略
 5. 不改变 DOCX/TXT/XLSX/PPTX 的解析逻辑
 ```
 

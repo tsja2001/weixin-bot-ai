@@ -12,7 +12,6 @@ const PDFJS_WASM_URL = pathToFileURL(path.join(APP_DIR, "node_modules/pdfjs-dist
 const PORT = Number(process.env.DOCUMENT_SERVICE_PORT || process.env.PORT || 8770);
 const OCR_SERVICE_URL = process.env.OCR_SERVICE_URL || "http://127.0.0.1:8765";
 const PDF_TEXT_MIN_CHARS = parseNumberEnv("PDF_TEXT_MIN_CHARS", 200);
-const PDF_SHORT_RENDER_SCALE = parseNumberEnv("PDF_SHORT_RENDER_SCALE", 2.0);
 const PDF_OCR_RENDER_SCALE = parseNumberEnv("PDF_OCR_RENDER_SCALE", 1.35);
 const PDF_OCR_PAGE_CONCURRENCY = parseIntRangeEnv("PDF_OCR_PAGE_CONCURRENCY", 1, 1, 2);
 
@@ -45,6 +44,10 @@ function sendJson(res, status, payload) {
 
 function sendError(res, status, message, details) {
   sendJson(res, status, { ok: false, error: message, details });
+}
+
+function sendNdjson(res, payload) {
+  res.write(`${JSON.stringify(payload)}\n`);
 }
 
 function readBody(req, maxBytes = 120 * 1024 * 1024) {
@@ -144,21 +147,10 @@ async function renderPdfPageToPng(page, scale) {
   return canvas.toBuffer("image/png");
 }
 
-async function parsePdf(buffer) {
+async function parsePdf(buffer, onProgress) {
   const doc = await loadPdf(buffer);
   const pageCount = doc.numPages;
   console.log(`[PDF] 解析完成: ${pageCount} 页`);
-
-  if (pageCount <= 3) {
-    const images = [];
-    for (let i = 1; i <= pageCount; i++) {
-      const page = await doc.getPage(i);
-      const pngBuffer = await renderPdfPageToPng(page, PDF_SHORT_RENDER_SCALE);
-      images.push({ mediaType: "image/png", base64: pngBuffer.toString("base64") });
-      console.log(`[PDF] 第 ${i}/${pageCount} 页渲染完成: ${(pngBuffer.length / 1024).toFixed(1)}KB`);
-    }
-    return { mode: "image", type: "pdf", pageCount, images };
-  }
 
   const startedAt = Date.now();
   const extractedText = await extractPdfText(doc);
@@ -179,6 +171,7 @@ async function parsePdf(buffer) {
     return { mode: "ocr_needed", type: "pdf", pageCount };
   }
 
+  await onProgress?.({ type: "ocr_start", pageCount });
   console.log(`[PDF] 开始 OCR: renderScale=${PDF_OCR_RENDER_SCALE}, pageConcurrency=${PDF_OCR_PAGE_CONCURRENCY}`);
   const pages = await mapWithConcurrency(
     Array.from({ length: pageCount }, (_, index) => index + 1),
@@ -189,6 +182,7 @@ async function parsePdf(buffer) {
       console.log(`[PDF] 第 ${pageNo}/${pageCount} 页渲染完成: ${(pngBuffer.length / 1024).toFixed(1)}KB，开始 OCR...`);
       const pageResult = await callOcrImage(pngBuffer, pageNo);
       console.log(`[PDF] 第 ${pageNo}/${pageCount} 页 OCR 完成: ${pageResult.text.length} 字`);
+      await onProgress?.({ type: "ocr_page", page: pageNo, pageCount, chars: pageResult.text.length });
       return pageResult;
     }
   );
@@ -253,9 +247,9 @@ async function parseOfficeFile(buffer, fileName, ext) {
   return { mode: "unsupported", type: ext, text: null, error: `不支持的文件类型: .${ext}` };
 }
 
-async function parseDocument(buffer, fileName) {
+async function parseDocument(buffer, fileName, onProgress) {
   const ext = fileName.split(".").pop()?.toLowerCase() || "";
-  if (ext === "pdf") return parsePdf(buffer);
+  if (ext === "pdf") return parsePdf(buffer, onProgress);
   return parseOfficeFile(buffer, fileName, ext);
 }
 
@@ -267,7 +261,6 @@ async function handleApi(req, res, url) {
       ocrServiceUrl: OCR_SERVICE_URL,
       config: {
         pdfTextMinChars: PDF_TEXT_MIN_CHARS,
-        pdfShortRenderScale: PDF_SHORT_RENDER_SCALE,
         pdfOcrRenderScale: PDF_OCR_RENDER_SCALE,
         pdfOcrPageConcurrency: PDF_OCR_PAGE_CONCURRENCY,
       },
@@ -286,6 +279,34 @@ async function handleApi(req, res, url) {
       elapsedMs: Date.now() - startedAt,
       ...result,
     });
+  }
+
+  if (url.pathname === "/parse-stream" && req.method === "POST") {
+    const startedAt = Date.now();
+    const buffer = await readBody(req);
+    const fileName = decodeURIComponent(req.headers["x-file-name"] || "document");
+    res.writeHead(200, {
+      "content-type": "application/x-ndjson; charset=utf-8",
+      "cache-control": "no-cache",
+      "x-accel-buffering": "no",
+    });
+
+    try {
+      const result = await parseDocument(buffer, fileName, async event => {
+        sendNdjson(res, { event: "progress", ...event });
+      });
+      sendNdjson(res, {
+        event: "result",
+        ok: result.mode !== "unsupported",
+        fileName,
+        bytes: buffer.length,
+        elapsedMs: Date.now() - startedAt,
+        ...result,
+      });
+    } catch (error) {
+      sendNdjson(res, { event: "error", error: error.message || "文档解析失败" });
+    }
+    return res.end();
   }
 
   return sendError(res, 404, "API 不存在");
