@@ -1,11 +1,14 @@
 import crypto from "crypto";
 import fs from "fs";
+import path from "path";
 import readline from "readline";
+import { fileURLToPath, pathToFileURL } from "url";
 import mammoth from "mammoth";
 
 // ========== 常量 ==========
 const BASE_URL = "https://ilinkai.weixin.qq.com";
 const CONFIG_FILE = "config.json";
+const SESSION_FILE = "session.json";
 const DEBUG_LOG_FILE = "logs/debug_messages.jsonl";
 const DEFAULT_PROMPT = "你是一个有帮助的AI助手，请用中文简洁地回复。字数尽量少一些";
 
@@ -33,6 +36,10 @@ const RECONNECT_CONFIG = {
 const HISTORY_MAX_TURNS = 10;           // 保留最近 N 轮对话
 const HISTORY_TTL_MS = 60 * 60 * 1000;  // 无活动多久后清空（毫秒）
 const HISTORY_MAX_CONTENT_LEN = 2000;   // 历史中单条消息最大字数
+const PDF_TEXT_MIN_CHARS = 200;         // 超过此长度优先使用 PDF 文本层，避免文本 PDF 误走 OCR
+const PDF_OCR_RENDER_SCALE = 1.35;      // 多页扫描件 OCR 渲染倍率，控制识别速度和内存
+const APP_DIR = path.dirname(fileURLToPath(import.meta.url));
+const PDFJS_WASM_URL = pathToFileURL(path.join(APP_DIR, "node_modules/pdfjs-dist/wasm")).href + "/";
 
 fs.mkdirSync("logs", { recursive: true });
 
@@ -76,41 +83,86 @@ function maskKey(key) {
   return key.slice(0, 5) + "*".repeat(key.length - 10) + key.slice(-5);
 }
 
+function saveSession() {
+  try {
+    fs.writeFileSync(SESSION_FILE, JSON.stringify({
+      botToken, botBaseUrl, loginTime, getUpdatesBuf
+    }), "utf-8");
+    console.log("[Session] 已保存登录态");
+  } catch (e) {
+    console.log("[Session] 保存失败:", e.message);
+  }
+}
+
+function loadSession() {
+  try {
+    if (!fs.existsSync(SESSION_FILE)) return null;
+    const raw = fs.readFileSync(SESSION_FILE, "utf-8");
+    const s = JSON.parse(raw);
+    if (!s.botToken || !s.loginTime) throw new Error("session 字段缺失");
+    console.log("[Session] 从文件恢复: loginTime=%s, baseUrl=%s",
+      new Date(s.loginTime).toISOString(), s.botBaseUrl);
+    return s;
+  } catch (e) {
+    console.log("[Session] 读取失败(%s)，将走扫码流程", e.message);
+    try { fs.unlinkSync(SESSION_FILE); } catch {}
+    return null;
+  }
+}
+
 function rlQuestion(rl, q) {
   return new Promise(resolve => rl.question(q, resolve));
 }
 // ==============================
 
 // ========== 文件下载解密 + 文本提取 ==========
-async function downloadAndDecryptFile(fileItem) {
-  const { media, file_name, md5, len } = fileItem;
+// 通用媒体下载+解密（图片/文件共用）
+async function downloadAndDecryptMedia(media, label, expectedMd5) {
   const { full_url, aes_key, encrypt_query_param } = media;
 
-  // 下载加密文件
   const url = full_url || `https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=${encodeURIComponent(encrypt_query_param)}`;
-  console.log(`[文件] 开始下载: ${file_name} (${len} bytes)`);
+  console.log(`[媒体] 开始下载: ${label}`);
   const res = await fetch(url, { signal: AbortSignal.timeout(60000) });
   if (!res.ok) throw new Error(`CDN 下载失败: HTTP ${res.status}`);
   const encryptedBuf = Buffer.from(await res.arrayBuffer());
-  console.log(`[文件] 下载完成: ${encryptedBuf.length} bytes`);
+  console.log(`[媒体] 下载完成: ${encryptedBuf.length} bytes`);
 
   // AES-128-ECB 解密（aes_key 是 base64 编码的 32 字符 hex 串，解码得到 16 字节密钥）
   const keyHex = Buffer.from(aes_key, "base64").toString("utf-8");
   const key = Buffer.from(keyHex, "hex");
-  console.log(`[文件] AES key (hex): ${keyHex}`);
+  console.log(`[媒体] AES key (hex): ${keyHex}`);
   const decipher = crypto.createDecipheriv("aes-128-ecb", key, null);
   decipher.setAutoPadding(true);
   const decrypted = Buffer.concat([decipher.update(encryptedBuf), decipher.final()]);
-  console.log(`[文件] 解密完成: ${decrypted.length} bytes`);
+  console.log(`[媒体] 解密完成: ${decrypted.length} bytes`);
 
   // 校验 MD5
-  const actualMd5 = crypto.createHash("md5").update(decrypted).digest("hex");
-  console.log(`[文件] MD5 期望: ${md5}, 实际: ${actualMd5}`);
-  if (md5 && actualMd5 !== md5) {
-    console.log(`[文件] 警告: MD5 不匹配!`);
+  if (expectedMd5) {
+    const actualMd5 = crypto.createHash("md5").update(decrypted).digest("hex");
+    console.log(`[媒体] MD5 期望: ${expectedMd5}, 实际: ${actualMd5}`);
+    if (actualMd5 !== expectedMd5) {
+      console.log(`[媒体] 警告: MD5 不匹配!`);
+    }
   }
 
-  return { buffer: decrypted, fileName: file_name, md5: actualMd5 };
+  return decrypted;
+}
+
+async function downloadAndDecryptFile(fileItem) {
+  const { media, file_name, md5, len } = fileItem;
+  console.log(`[文件] 开始下载: ${file_name} (${len} bytes)`);
+  const buffer = await downloadAndDecryptMedia(media, file_name, md5);
+  return { buffer, fileName: file_name };
+}
+
+// 图片格式检测（文件头 magic number）
+function detectImageFormat(buf) {
+  if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return "image/jpeg";
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) return "image/png";
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return "image/gif";
+  if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46
+    && buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50) return "image/webp";
+  return null;
 }
 
 async function extractTextFromFile({ buffer, fileName }) {
@@ -129,9 +181,165 @@ async function extractTextFromFile({ buffer, fileName }) {
     console.log(`[文件] txt 提取: ${text.length} 字符`);
     return { text, type: "txt" };
   }
+  if (ext === "xlsx" || ext === "xls") {
+    const XLSX = await import("xlsx");
+    const wb = XLSX.read(buffer, { type: "buffer" });
+    const text = wb.SheetNames.map(name => {
+      const csv = XLSX.utils.sheet_to_csv(wb.Sheets[name]);
+      return `## Sheet: ${name}\n\n${csv}`;
+    }).join("\n\n");
+    console.log(`[文件] xlsx 提取: ${text.length} 字符, ${wb.SheetNames.length} sheets`);
+    return { text, type: "xlsx" };
+  }
+  if (ext === "pptx") {
+    const tmpPath = `logs/tmp_${Date.now()}.pptx`;
+    try {
+      fs.writeFileSync(tmpPath, buffer);
+      const PPTXParser = (await import("node-pptx-parser")).default;
+      const parser = new PPTXParser(tmpPath);
+      const slides = await parser.extractText();
+      const text = slides.map((s, i) => {
+        const slideText = Array.isArray(s.text) ? s.text.join("\n") : s.text;
+        return `## Slide ${i + 1}\n\n${slideText}`;
+      }).join("\n\n");
+      console.log(`[文件] pptx 提取: ${text.length} 字符, ${slides.length} slides`);
+      return { text, type: "pptx" };
+    } finally {
+      try { fs.unlinkSync(tmpPath); } catch {}
+    }
+  }
   return { text: null, type: ext, error: `不支持的文件类型: .${ext}` };
 }
 // ===============================================
+
+// ========== PDF 处理 ==========
+async function ocrImages(imageBuffers) {
+  const url = `${botConfig.ocr_service_url}/ocr/batch`;
+  const formData = new FormData();
+  imageBuffers.forEach((buf, i) => {
+    formData.append("files", new Blob([buf]), `page_${i + 1}.png`);
+  });
+  const res = await fetch(url, {
+    method: "POST",
+    body: formData,
+    signal: AbortSignal.timeout(120000),
+  });
+  if (!res.ok) throw new Error(`OCR 服务返回 HTTP ${res.status}`);
+  const data = await res.json();
+  return data.pages; // [{page, text}, ...]
+}
+
+async function ocrImage(imageBuffer, pageNo) {
+  const url = `${botConfig.ocr_service_url}/ocr/image`;
+  const formData = new FormData();
+  formData.append("file", new Blob([imageBuffer]), `page_${pageNo}.png`);
+  const res = await fetch(url, {
+    method: "POST",
+    body: formData,
+    signal: AbortSignal.timeout(90000),
+  });
+  if (!res.ok) throw new Error(`OCR 服务返回 HTTP ${res.status}`);
+  const data = await res.json();
+  return { page: pageNo, text: data.text ?? "" };
+}
+
+function normalizePdfText(text) {
+  return text
+    .replace(/\u0000/g, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+async function extractPdfText(doc) {
+  const pages = [];
+  for (let i = 1; i <= doc.numPages; i++) {
+    const page = await doc.getPage(i);
+    const content = await page.getTextContent();
+    const text = normalizePdfText(content.items.map(item => item.str).join(" "));
+    pages.push({ page: i, text });
+  }
+  const fullText = normalizePdfText(
+    pages
+      .filter(p => p.text)
+      .map(p => `## 第 ${p.page} 页\n\n${p.text}`)
+      .join("\n\n")
+  );
+  return { pages, fullText };
+}
+
+async function renderPdfPageToPng(page, scale) {
+  const { createCanvas } = await import("@napi-rs/canvas");
+  const viewport = page.getViewport({ scale });
+  const canvas = createCanvas(viewport.width, viewport.height);
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "rgb(255, 255, 255)";
+  ctx.fillRect(0, 0, viewport.width, viewport.height);
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  return canvas.toBuffer("image/png");
+}
+
+async function extractFromPdf(buffer) {
+  const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  // Buffer extends Uint8Array in Node.js, so instanceof alone doesn't guard.
+  // pdfjs-dist v5+ requires a pure Uint8Array, not a Buffer.
+  const data = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+
+  const doc = await pdfjsLib.getDocument({ data, wasmUrl: PDFJS_WASM_URL, useWasm: false }).promise;
+  const pageCount = doc.numPages;
+  console.log(`[PDF] 解析完成: ${pageCount} 页`);
+
+  if (pageCount <= 3) {
+    const images = [];
+
+    for (let i = 1; i <= pageCount; i++) {
+      const page = await doc.getPage(i);
+      const pngBuffer = await renderPdfPageToPng(page, 2.0);
+      const base64 = pngBuffer.toString("base64");
+      images.push({ mediaType: "image/png", base64 });
+
+      console.log(`[PDF] 第 ${i}/${pageCount} 页渲染完成: ${(pngBuffer.length / 1024).toFixed(1)}KB`);
+    }
+
+    return { mode: "image", pageCount, images };
+  }
+
+  // >3 pages: 检查 OCR 服务是否可用
+  if (!botConfig.ocr_service_url) {
+    return { mode: "ocr_needed", pageCount };
+  }
+
+  const t0 = Date.now();
+  const extractedText = await extractPdfText(doc);
+  if (extractedText.fullText.length >= PDF_TEXT_MIN_CHARS) {
+    console.log(`[PDF] 文本层提取完成: ${extractedText.fullText.length} 字，跳过 OCR`);
+    return { mode: "ocr_text", pageCount, text: extractedText.fullText, source: "pdf_text" };
+  }
+
+  let pages;
+  try {
+    pages = [];
+    for (let i = 1; i <= pageCount; i++) {
+      const page = await doc.getPage(i);
+      const pngBuffer = await renderPdfPageToPng(page, PDF_OCR_RENDER_SCALE);
+      console.log(`[PDF] 第 ${i}/${pageCount} 页渲染完成: ${(pngBuffer.length / 1024).toFixed(1)}KB，开始 OCR...`);
+      const pageResult = await ocrImage(pngBuffer, i);
+      pages.push(pageResult);
+      console.log(`[PDF] 第 ${i}/${pageCount} 页 OCR 完成: ${pageResult.text.length} 字`);
+    }
+    console.log(`[PDF] OCR 完成，耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  } catch (e) {
+    console.log(`[PDF] OCR 调用失败: ${e.message}`);
+    throw new Error(`OCR 服务暂时不可用: ${e.message}`);
+  }
+
+  const fullText = pages.map(p => `## 第 ${p.page} 页\n\n${p.text}`).join("\n\n");
+  if (!fullText.trim()) {
+    return { mode: "ocr_text", pageCount, text: "(未能识别出文字内容)" };
+  }
+  return { mode: "ocr_text", pageCount, text: fullText };
+}
+// ============================
 
 // ========== 配置文件加载 ==========
 async function loadOrCreateConfig() {
@@ -247,7 +455,12 @@ function addToHistory(fromId, userMsg, assistantReply) {
     ? s.slice(0, HISTORY_MAX_CONTENT_LEN) + "..."
     : s;
 
-  entry.messages.push({ role: "user", content: truncate(userMsg) });
+  // 内容可能是字符串或 content blocks 数组，历史只保留 text 部分
+  const userText = typeof userMsg === "string"
+    ? userMsg
+    : userMsg.filter(b => b.type === "text").map(b => b.text).join("\n");
+
+  entry.messages.push({ role: "user", content: truncate(userText) });
   entry.messages.push({ role: "assistant", content: truncate(assistantReply) });
 
   // 保留最近 N 轮（每轮 = user + assistant 两条消息）
@@ -332,7 +545,7 @@ async function ensureTypingTicket(fromId, contextToken) {
 }
 
 // AI 回复完整流程：正在输入 → 调 AI → 发送 → 停止输入 → 记入历史
-async function sendAiReply(fromId, contextToken, userPrompt) {
+async function sendAiReply(fromId, contextToken, userContent) {
   const ticket = await ensureTypingTicket(fromId, contextToken);
 
   // status=1 显示"正在输入..."
@@ -344,10 +557,10 @@ async function sendAiReply(fromId, contextToken, userPrompt) {
 
   // 调用 AI
   const history = getHistoryForUser(fromId);
-  const reply = await callAI(userPrompt, botConfig, history);
+  const reply = await callAI(userContent, botConfig, history);
   resetStatsIfNewDay();
   dailyStats.messageCount++;
-  addToHistory(fromId, userPrompt, reply);
+  addToHistory(fromId, userContent, reply);
 
   // 发送回复
   await sendMsgSafe(fromId, contextToken, reply);
@@ -365,18 +578,22 @@ async function sendAiReply(fromId, contextToken, userPrompt) {
 // =========================================
 
 // ========== AI API 调用 ==========
-async function callAI(userMessage, config, history = []) {
+async function callAI(userContent, config, history = []) {
   const headers = {
     "Authorization": `Bearer ${config.api_key}`,
     "content-type": "application/json",
     "User-Agent": "claude-cli/2.0.76 (external, cli)",
   };
 
+  const userMessage = typeof userContent === "string"
+    ? { role: "user", content: userContent }
+    : { role: "user", content: userContent };
+
   const payload = {
     model: config.model,
     max_tokens: 4096,
     system: config.prompt,
-    messages: [...history, { role: "user", content: userMessage }],
+    messages: [...history, userMessage],
   };
 
   const retryDelays = [2, 4, 8, 16, 32]; // 秒
@@ -487,6 +704,7 @@ async function doReconnect() {
 
   reconnectInProgress = false;
   loginTime = Date.now();
+  saveSession();
 }
 
 async function reconnectTimerLoop() {
@@ -721,23 +939,67 @@ async function messageLoop() {
         console.log(`\n┌── [文件消息] ${fileItem.file_name} (${fileItem.len} bytes) ──`);
         try {
           const fileData = await downloadAndDecryptFile(fileItem);
-          const extracted = await extractTextFromFile(fileData);
+          const ext = fileData.fileName.split(".").pop()?.toLowerCase();
 
-          if (extracted.text) {
-            // 暂存文件内容，等用户下一句话再一起传给 AI
-            pendingFiles.set(fromId, {
-              fileName: fileItem.file_name,
-              text: extracted.text,
-              timestamp: Date.now(),
-            });
-            const charCount = extracted.text.length;
-            const preview = extracted.text.slice(0, 50);
-            const reply = `已收到「${fileItem.file_name}」，解析出约 ${charCount} 字内容，开头预览：\n\n---\n${preview}${extracted.text.length > 200 ? "\n…(后续内容已就绪)" : ""}\n---\n\n请告诉我您的要求，我会结合文件内容一并处理。`;
-            console.log(`\n╔══ 文件内容（已暂存，等用户指令） ════════════════\n${extracted.text.slice(0, 500)}${extracted.text.length > 500 ? "...(截断)" : ""}\n──────────────────────────────────────────`);
-            await sendMsgSafe(fromId, contextToken, reply);
-          } else {
+          if (ext === "pdf") {
+            // 先发中间反馈（OCR 处理耗时）
             await sendMsgSafe(fromId, contextToken,
-              `[Bot] 收到文件 "${fileItem.file_name}"，但无法解析 .${extracted.type} 格式。目前支持: .docx, .txt`);
+              `已收到「${fileItem.file_name}」，正在处理，请稍候...`);
+
+            let result;
+            try {
+              result = await extractFromPdf(fileData.buffer);
+            } catch (e) {
+              console.log(`[PDF] 处理失败: ${e.message}`);
+              console.log(`[PDF] 错误栈: ${e.stack}`);
+              await sendMsgSafe(fromId, contextToken, `[Bot] PDF 处理失败: ${e.message}`);
+              continue;
+            }
+
+            if (result.mode === "image") {
+              pendingFiles.set(fromId, {
+                type: "image",
+                fileName: fileItem.file_name,
+                images: result.images,
+                timestamp: Date.now(),
+              });
+              await sendMsgSafe(fromId, contextToken,
+                `已收到「${fileItem.file_name}」（${result.pageCount}页），已转换为图片，请告诉我您的要求。`);
+            } else if (result.mode === "ocr_text") {
+              if (result.text === "(未能识别出文字内容)") {
+                await sendMsgSafe(fromId, contextToken,
+                  `已收到「${fileItem.file_name}」（${result.pageCount}页），但未能识别出文字内容，可能是扫描质量较低或纯图片页面。`);
+              } else {
+                pendingFiles.set(fromId, {
+                  fileName: fileItem.file_name,
+                  text: result.text,
+                  timestamp: Date.now(),
+                });
+                const charCount = result.text.length;
+                await sendMsgSafe(fromId, contextToken,
+                  `已收到「${fileItem.file_name}」（${result.pageCount}页），OCR识别出约 ${charCount} 字内容，请告诉我您的要求。`);
+              }
+            } else {
+              await sendMsgSafe(fromId, contextToken,
+                `已收到「${fileItem.file_name}」（${result.pageCount}页），超过3页的PDF识别功能暂未配置OCR服务。`);
+            }
+          } else {
+            const extracted = await extractTextFromFile(fileData);
+            if (extracted.text) {
+              pendingFiles.set(fromId, {
+                fileName: fileItem.file_name,
+                text: extracted.text,
+                timestamp: Date.now(),
+              });
+              const charCount = extracted.text.length;
+              const preview = extracted.text.slice(0, 50);
+              const reply = `已收到「${fileItem.file_name}」，解析出约 ${charCount} 字内容，开头预览：\n\n---\n${preview}${extracted.text.length > 200 ? "\n…(后续内容已就绪)" : ""}\n---\n\n请告诉我您的要求，我会结合文件内容一并处理。`;
+              console.log(`\n╔══ 文件内容（已暂存，等用户指令） ════════════════\n${extracted.text.slice(0, 500)}${extracted.text.length > 500 ? "...(截断)" : ""}\n──────────────────────────────────────────`);
+              await sendMsgSafe(fromId, contextToken, reply);
+            } else {
+              await sendMsgSafe(fromId, contextToken,
+                `[Bot] 收到文件 "${fileItem.file_name}"，但无法解析 .${extracted.type} 格式。目前支持: .docx, .txt, .pdf, .xlsx, .pptx`);
+            }
           }
         } catch (e) {
           console.log(`[文件] 处理失败: ${e.message}`);
@@ -747,9 +1009,40 @@ async function messageLoop() {
         continue;
       }
 
-      // >> 其他非文本消息（图片/语音/视频等）
+      // >> 图片消息（type=2）
+      if (firstItem?.type === 2) {
+        const imgItem = firstItem.image_item;
+        console.log(`\n┌── [图片消息] ──`);
+        try {
+          const imgBuf = await downloadAndDecryptMedia(imgItem.media, "图片消息");
+          const mediaType = detectImageFormat(imgBuf);
+          if (!mediaType) {
+            console.log(`[图片] 无法识别图片格式，文件头: ${imgBuf.slice(0, 16).toString("hex")}`);
+            await sendMsgSafe(fromId, contextToken, "[Bot] 收到图片，但无法识别格式，请确认发送的是 JPEG/PNG/GIF/WebP 图片");
+          } else {
+            const base64 = imgBuf.toString("base64");
+            const fileName = `图片_${Date.now()}.${mediaType.split("/")[1]}`;
+            pendingFiles.set(fromId, {
+              type: "image",
+              fileName,
+              images: [{ mediaType, base64 }],
+              timestamp: Date.now(),
+            });
+            console.log(`[图片] 已暂存: ${mediaType} ${(imgBuf.length / 1024).toFixed(1)}KB`);
+            await sendMsgSafe(fromId, contextToken,
+              `已收到图片「${fileName}」，请告诉我您的要求（如"描述这张图"、"图上写了什么"等）。`);
+          }
+        } catch (e) {
+          console.log(`[图片] 处理失败: ${e.message}`);
+          await sendMsgSafe(fromId, contextToken, `[Bot] 图片处理失败: ${e.message}`);
+        }
+        console.log(`└──────────────────────────────────────────────────`);
+        continue;
+      }
+
+      // >> 其他非文本消息（语音/视频等）
       if (firstItem?.type !== 1) {
-        const typeNames = ["", "文本", "图片", "语音", "文件", "视频"];
+        const typeNames = ["", "文本", "", "语音", "文件", "视频"];
         await sendMsgSafe(fromId, contextToken,
           `[Bot] 收到 ${typeNames[firstItem?.type] || "未知"}消息，暂不支持此类型`);
         continue;
@@ -823,7 +1116,7 @@ async function messageLoop() {
         continue;
       }
 
-      // 5. 以上都不匹配 → AI 对话（检查是否有待处理的文件）
+      // 5. 以上都不匹配 → AI 对话（检查是否有待处理的文件/图片）
       const pendingFile = pendingFiles.get(fromId);
       if (pendingFile) {
         pendingFiles.delete(fromId);
@@ -831,7 +1124,18 @@ async function messageLoop() {
         if (Date.now() - pendingFile.timestamp > PENDING_FILE_TTL_MS) {
           console.log(`[文件] ${fromId} 的待处理文件已超时，丢弃`);
           await sendAiReply(fromId, contextToken, text);
+        } else if (pendingFile.type === "image") {
+          const content = [
+            ...pendingFile.images.map(img => ({
+              type: "image",
+              source: { type: "base64", media_type: img.mediaType, data: img.base64 }
+            })),
+            { type: "text", text: `[用户上传了: ${pendingFile.fileName}]\n${text}` }
+          ];
+          console.log(`\n╔══ 合并图片+用户要求（传给AI） ══════════════\n图片=${pendingFile.fileName} 要求=${text.slice(0, 100)}\n──────────────────────────────────────────`);
+          await sendAiReply(fromId, contextToken, content);
         } else {
+          // text 类型（向后兼容无 type 字段的旧 pending 数据）
           const combined = `[用户之前发送了文件: ${pendingFile.fileName}]\n\n${pendingFile.text}\n\n[用户要求]\n${text}`;
           console.log(`\n╔══ 合并文件+用户要求（传给AI） ══════════════\n文件=${pendingFile.fileName} 要求=${text.slice(0, 100)}\n──────────────────────────────────────────`);
           await sendAiReply(fromId, contextToken, combined);
@@ -855,49 +1159,77 @@ console.log(`
 // 0. 加载配置文件
 const botConfig = await loadOrCreateConfig();
 
-// 1. 获取登录二维码
-const { qrcode, qrcode_img_content } = await fetch(
-  `${BASE_URL}/ilink/bot/get_bot_qrcode?bot_type=3`
-).then(r => r.json());
-
-if (qrcode_img_content) {
-  const content = String(qrcode_img_content);
-  if (content.startsWith("data:image/")) {
-    const [header, b64] = content.split(",");
-    const ext = header.match(/data:image\/(\w+)/)?.[1] ?? "png";
-    fs.writeFileSync(`qrcode.${ext}`, Buffer.from(b64, "base64"));
-    console.log(`二维码已保存到 qrcode.${ext}`);
-  } else if (content.startsWith("http")) {
-    console.log("二维码图片地址:", content);
-    console.log("请将图片地址发送给文件传输助手，然后用手机端微信打开链接进行连接！！！");
-  } else if (content.startsWith("<svg")) {
-    fs.writeFileSync("qrcode.svg", content);
-    console.log("二维码已保存到 qrcode.svg，用浏览器打开");
-  } else {
-    fs.writeFileSync("qrcode.png", Buffer.from(content, "base64"));
-    console.log("二维码已保存到 qrcode.png");
+// 0.1 OCR 服务健康检查（非阻塞）
+if (botConfig.ocr_service_url) {
+  try {
+    const hc = await fetch(`${botConfig.ocr_service_url}/health`, {
+      signal: AbortSignal.timeout(5000),
+    }).then(r => r.json());
+    if (hc?.status === "ok") {
+      console.log(`[OCR] 服务健康检查通过: ${botConfig.ocr_service_url} (${hc.model})`);
+    } else {
+      console.log(`[OCR] 服务异常: ${JSON.stringify(hc)}`);
+    }
+  } catch (e) {
+    console.log(`[OCR] 服务健康检查失败（${e.message}），OCR 功能将不可用但 bot 主流程不受影响`);
   }
 }
 
-// 2. 等待扫码确认
-console.log("等待扫码...");
-while (true) {
-  const status = await fetch(
-    `${BASE_URL}/ilink/bot/get_qrcode_status?qrcode=${qrcode}`
+// 1. 尝试恢复登录态，有效则跳过扫码
+const savedSession = loadSession();
+if (savedSession) {
+  botToken = savedSession.botToken;
+  botBaseUrl = savedSession.botBaseUrl;
+  loginTime = savedSession.loginTime;
+  getUpdatesBuf = savedSession.getUpdatesBuf ?? "";
+  console.log("[Session] 登录态有效，跳过扫码直接启动");
+} else {
+  // 2. 获取登录二维码
+  const { qrcode, qrcode_img_content } = await fetch(
+    `${BASE_URL}/ilink/bot/get_bot_qrcode?bot_type=3`
   ).then(r => r.json());
 
-  if (status.status === "confirmed") {
-    botToken = status.bot_token;
-    botBaseUrl = status.baseurl ?? BASE_URL;
-    console.log("登录成功！");
-    console.log("=".repeat(40));
-    console.log(COMMANDS_MSG);
-    console.log("=".repeat(40));
-    break;
+  if (qrcode_img_content) {
+    const content = String(qrcode_img_content);
+    if (content.startsWith("data:image/")) {
+      const [header, b64] = content.split(",");
+      const ext = header.match(/data:image\/(\w+)/)?.[1] ?? "png";
+      fs.writeFileSync(`qrcode.${ext}`, Buffer.from(b64, "base64"));
+      console.log(`二维码已保存到 qrcode.${ext}`);
+    } else if (content.startsWith("http")) {
+      console.log("二维码图片地址:", content);
+      console.log("请将图片地址发送给文件传输助手，然后用手机端微信打开链接进行连接！！！");
+    } else if (content.startsWith("<svg")) {
+      fs.writeFileSync("qrcode.svg", content);
+      console.log("二维码已保存到 qrcode.svg，用浏览器打开");
+    } else {
+      fs.writeFileSync("qrcode.png", Buffer.from(content, "base64"));
+      console.log("二维码已保存到 qrcode.png");
+    }
   }
-  await sleep(1000);
+
+  // 3. 等待扫码确认
+  console.log("等待扫码...");
+  while (true) {
+    const status = await fetch(
+      `${BASE_URL}/ilink/bot/get_qrcode_status?qrcode=${qrcode}`
+    ).then(r => r.json());
+
+    if (status.status === "confirmed") {
+      botToken = status.bot_token;
+      botBaseUrl = status.baseurl ?? BASE_URL;
+      loginTime = Date.now();
+      saveSession();
+      console.log("登录成功！");
+      console.log("=".repeat(40));
+      console.log(COMMANDS_MSG);
+      console.log("=".repeat(40));
+      break;
+    }
+    await sleep(1000);
+  }
 }
 
-// 3. 并发启动消息循环 + 定时器循环
-loginTime = Date.now();
+// 4. 并发启动消息循环 + 重连定时器 + 调度器
+if (!loginTime) loginTime = Date.now();
 await Promise.all([messageLoop(), reconnectTimerLoop(), schedulerLoop()]);

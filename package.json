@@ -1,0 +1,1 @@
+{"type":"module","dependencies":{"@napi-rs/canvas":"^0.1.100","mammoth":"^1.12.0","node-pptx-parser":"^1.0.1","pdfjs-dist":"^5.7.284","xlsx":"^0.18.5"}}
