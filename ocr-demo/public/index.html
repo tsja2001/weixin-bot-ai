@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OCR 测试台</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>OCR 测试台</h1>
+        <p id="serviceStatus">正在检查服务...</p>
+      </div>
+      <button id="healthBtn" type="button">刷新状态</button>
+    </header>
+
+    <main class="layout">
+      <section class="panel upload-panel">
+        <div class="field">
+          <label for="mode">测试模式</label>
+          <select id="mode">
+            <option value="image">单张图片 OCR</option>
+            <option value="batch">多图 batch OCR</option>
+            <option value="pdf-auto">PDF 自动：有文本层则跳过 OCR</option>
+            <option value="pdf-text">PDF 只读文本层</option>
+            <option value="pdf-ocr">PDF 强制逐页 OCR</option>
+          </select>
+        </div>
+
+        <label id="dropzone" class="dropzone" for="fileInput">
+          <input id="fileInput" type="file" multiple />
+          <span>点击或拖入文件</span>
+          <small>图片支持 JPG/PNG/WebP；PDF 支持文本层提取与逐页 OCR</small>
+        </label>
+
+        <div id="fileList" class="file-list"></div>
+
+        <div class="actions">
+          <button id="runBtn" type="button">开始识别</button>
+          <button id="clearBtn" type="button" class="secondary">清空</button>
+        </div>
+      </section>
+
+      <section class="panel result-panel">
+        <div class="result-header">
+          <h2>识别结果</h2>
+          <div id="metrics" class="metrics"></div>
+        </div>
+        <div id="progress" class="progress hidden">
+          <div></div>
+        </div>
+        <div id="results" class="results empty">等待上传文件。</div>
+      </section>
+    </main>
+
+    <template id="pageTemplate">
+      <article class="page-result">
+        <div class="preview"></div>
+        <div class="text-block">
+          <div class="page-meta"></div>
+          <textarea readonly spellcheck="false"></textarea>
+        </div>
+      </article>
+    </template>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

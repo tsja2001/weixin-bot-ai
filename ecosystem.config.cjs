@@ -51,5 +51,20 @@ module.exports = {
         NODE_ENV: "production",
       },
     },
+    {
+      name: "ocr-service",
+      script: "venv/bin/uvicorn",
+      args: "main:app --host 127.0.0.1 --port 8765",
+      cwd: "/opt/weixin-bot-ai/ocr-service",
+      interpreter: "none",
+      autorestart: true,
+      max_restarts: 10,
+      out_file: "logs/out.log",
+      error_file: "logs/err.log",
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
+      env: {
+        NODE_ENV: "production",
+      },
+    },
   ],
 };

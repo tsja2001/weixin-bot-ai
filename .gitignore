@@ -4,8 +4,8 @@ session.json
 instances/*/config.json
 instances/*/session.json
 
-# Claude Code 本地设置（含 token）
-.claude/settings.local.json
+# Claude Code 本地设置（含 token）和工作区
+.claude/
 
 # 依赖
 node_modules/
@@ -13,6 +13,7 @@ node_modules/
 # 日志
 logs/
 instances/*/logs/
+temp/
 
 # 微信登录二维码
 qrcode.*
@@ -20,6 +21,8 @@ qrcode.*
 # Python
 __pycache__/
 *.pyc
+venv/
+.venv/
 
 # macOS
 .DS_Store
