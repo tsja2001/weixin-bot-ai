@@ -1,9 +1,6 @@
 import crypto from "crypto";
 import fs from "fs";
-import path from "path";
 import readline from "readline";
-import { fileURLToPath, pathToFileURL } from "url";
-import mammoth from "mammoth";
 
 // ========== 常量 ==========
 const BASE_URL = "https://ilinkai.weixin.qq.com";
@@ -36,11 +33,7 @@ const RECONNECT_CONFIG = {
 const HISTORY_MAX_TURNS = 10;           // 保留最近 N 轮对话
 const HISTORY_TTL_MS = 60 * 60 * 1000;  // 无活动多久后清空（毫秒）
 const HISTORY_MAX_CONTENT_LEN = 2000;   // 历史中单条消息最大字数
-const PDF_TEXT_MIN_CHARS = 200;         // 超过此长度优先使用 PDF 文本层，避免文本 PDF 误走 OCR
-const PDF_OCR_RENDER_SCALE = parsePositiveNumberEnv("PDF_OCR_RENDER_SCALE", 1.35); // 多页扫描件 OCR 渲染倍率
-const PDF_OCR_PAGE_CONCURRENCY = parseIntRangeEnv("PDF_OCR_PAGE_CONCURRENCY", 1, 1, 2); // 多页 OCR 页级并发
-const APP_DIR = path.dirname(fileURLToPath(import.meta.url));
-const PDFJS_WASM_URL = pathToFileURL(path.join(APP_DIR, "node_modules/pdfjs-dist/wasm")).href + "/";
+const DEFAULT_DOCUMENT_SERVICE_URL = process.env.DOCUMENT_SERVICE_URL || "http://127.0.0.1:8770";
 
 fs.mkdirSync("logs", { recursive: true });
 
@@ -65,28 +58,6 @@ function resetStatsIfNewDay() {
 
 // ========== 工具函数 ==========
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-function parsePositiveNumberEnv(name, defaultValue) {
-  const raw = process.env[name];
-  if (!raw) return defaultValue;
-  const value = Number(raw);
-  if (!Number.isFinite(value) || value <= 0) {
-    console.log(`[配置] ${name}=${raw} 无效，使用默认值 ${defaultValue}`);
-    return defaultValue;
-  }
-  return value;
-}
-
-function parseIntRangeEnv(name, defaultValue, min, max) {
-  const raw = process.env[name];
-  if (!raw) return defaultValue;
-  const value = Number.parseInt(raw, 10);
-  if (!Number.isInteger(value) || value < min || value > max) {
-    console.log(`[配置] ${name}=${raw} 无效，使用默认值 ${defaultValue}`);
-    return defaultValue;
-  }
-  return value;
-}
 
 function debugLog(entry) {
   const line = JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n";
@@ -188,199 +159,24 @@ function detectImageFormat(buf) {
   return null;
 }
 
-async function extractTextFromFile({ buffer, fileName }) {
-  const ext = fileName.split(".").pop()?.toLowerCase();
-  if (ext === "docx") {
-    const result = await mammoth.extractRawText({ buffer });
-    const text = result.value.trim();
-    console.log(`[文件] mammoth 提取: ${text.length} 字符`);
-    if (result.messages.length > 0) {
-      console.log(`[文件] mammoth 警告:`, result.messages.map(m => m.message).join("; "));
-    }
-    return { text, type: "docx" };
-  }
-  if (ext === "txt") {
-    const text = buffer.toString("utf-8").trim();
-    console.log(`[文件] txt 提取: ${text.length} 字符`);
-    return { text, type: "txt" };
-  }
-  if (ext === "xlsx" || ext === "xls") {
-    const XLSX = await import("xlsx");
-    const wb = XLSX.read(buffer, { type: "buffer" });
-    const text = wb.SheetNames.map(name => {
-      const csv = XLSX.utils.sheet_to_csv(wb.Sheets[name]);
-      return `## Sheet: ${name}\n\n${csv}`;
-    }).join("\n\n");
-    console.log(`[文件] xlsx 提取: ${text.length} 字符, ${wb.SheetNames.length} sheets`);
-    return { text, type: "xlsx" };
-  }
-  if (ext === "pptx") {
-    const tmpPath = `logs/tmp_${Date.now()}.pptx`;
-    try {
-      fs.writeFileSync(tmpPath, buffer);
-      const PPTXParser = (await import("node-pptx-parser")).default;
-      const parser = new PPTXParser(tmpPath);
-      const slides = await parser.extractText();
-      const text = slides.map((s, i) => {
-        const slideText = Array.isArray(s.text) ? s.text.join("\n") : s.text;
-        return `## Slide ${i + 1}\n\n${slideText}`;
-      }).join("\n\n");
-      console.log(`[文件] pptx 提取: ${text.length} 字符, ${slides.length} slides`);
-      return { text, type: "pptx" };
-    } finally {
-      try { fs.unlinkSync(tmpPath); } catch {}
-    }
-  }
-  return { text: null, type: ext, error: `不支持的文件类型: .${ext}` };
-}
-// ===============================================
-
-// ========== PDF 处理 ==========
-async function ocrImages(imageBuffers) {
-  const url = `${botConfig.ocr_service_url}/ocr/batch`;
-  const formData = new FormData();
-  imageBuffers.forEach((buf, i) => {
-    formData.append("files", new Blob([buf]), `page_${i + 1}.png`);
-  });
-  const res = await fetch(url, {
+async function parseDocumentFile({ buffer, fileName }) {
+  const documentServiceUrl = botConfig.document_service_url || DEFAULT_DOCUMENT_SERVICE_URL;
+  const res = await fetch(`${documentServiceUrl}/parse`, {
     method: "POST",
-    body: formData,
-    signal: AbortSignal.timeout(120000),
+    headers: {
+      "content-type": "application/octet-stream",
+      "x-file-name": encodeURIComponent(fileName),
+    },
+    body: buffer,
+    signal: AbortSignal.timeout(10 * 60 * 1000),
   });
-  if (!res.ok) throw new Error(`OCR 服务返回 HTTP ${res.status}`);
-  const data = await res.json();
-  return data.pages; // [{page, text}, ...]
-}
 
-async function ocrImage(imageBuffer, pageNo) {
-  const url = `${botConfig.ocr_service_url}/ocr/image`;
-  const formData = new FormData();
-  formData.append("file", new Blob([imageBuffer]), `page_${pageNo}.png`);
-  const res = await fetch(url, {
-    method: "POST",
-    body: formData,
-    signal: AbortSignal.timeout(90000),
-  });
-  if (!res.ok) throw new Error(`OCR 服务返回 HTTP ${res.status}`);
-  const data = await res.json();
-  return { page: pageNo, text: data.text ?? "" };
-}
-
-function normalizePdfText(text) {
-  return text
-    .replace(/\u0000/g, "")
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
-async function extractPdfText(doc) {
-  const pages = [];
-  for (let i = 1; i <= doc.numPages; i++) {
-    const page = await doc.getPage(i);
-    const content = await page.getTextContent();
-    const text = normalizePdfText(content.items.map(item => item.str).join(" "));
-    pages.push({ page: i, text });
-  }
-  const fullText = normalizePdfText(
-    pages
-      .filter(p => p.text)
-      .map(p => `## 第 ${p.page} 页\n\n${p.text}`)
-      .join("\n\n")
-  );
-  return { pages, fullText };
-}
-
-async function renderPdfPageToPng(page, scale) {
-  const { createCanvas } = await import("@napi-rs/canvas");
-  const viewport = page.getViewport({ scale });
-  const canvas = createCanvas(viewport.width, viewport.height);
-  const ctx = canvas.getContext("2d");
-  ctx.fillStyle = "rgb(255, 255, 255)";
-  ctx.fillRect(0, 0, viewport.width, viewport.height);
-  await page.render({ canvasContext: ctx, viewport }).promise;
-  return canvas.toBuffer("image/png");
-}
-
-async function mapWithConcurrency(items, concurrency, worker) {
-  const results = new Array(items.length);
-  let nextIndex = 0;
-
-  async function runWorker() {
-    while (nextIndex < items.length) {
-      const index = nextIndex++;
-      results[index] = await worker(items[index], index);
-    }
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`文档解析服务返回 HTTP ${res.status}: ${text.slice(0, 300)}`);
   }
 
-  const workerCount = Math.min(concurrency, items.length);
-  await Promise.all(Array.from({ length: workerCount }, runWorker));
-  return results;
-}
-
-async function extractFromPdf(buffer) {
-  const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
-  // Buffer extends Uint8Array in Node.js, so instanceof alone doesn't guard.
-  // pdfjs-dist v5+ requires a pure Uint8Array, not a Buffer.
-  const data = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-
-  const doc = await pdfjsLib.getDocument({ data, wasmUrl: PDFJS_WASM_URL, useWasm: false }).promise;
-  const pageCount = doc.numPages;
-  console.log(`[PDF] 解析完成: ${pageCount} 页`);
-
-  if (pageCount <= 3) {
-    const images = [];
-
-    for (let i = 1; i <= pageCount; i++) {
-      const page = await doc.getPage(i);
-      const pngBuffer = await renderPdfPageToPng(page, 2.0);
-      const base64 = pngBuffer.toString("base64");
-      images.push({ mediaType: "image/png", base64 });
-
-      console.log(`[PDF] 第 ${i}/${pageCount} 页渲染完成: ${(pngBuffer.length / 1024).toFixed(1)}KB`);
-    }
-
-    return { mode: "image", pageCount, images };
-  }
-
-  // >3 pages: 检查 OCR 服务是否可用
-  if (!botConfig.ocr_service_url) {
-    return { mode: "ocr_needed", pageCount };
-  }
-
-  const t0 = Date.now();
-  const extractedText = await extractPdfText(doc);
-  if (extractedText.fullText.length >= PDF_TEXT_MIN_CHARS) {
-    console.log(`[PDF] 文本层提取完成: ${extractedText.fullText.length} 字，跳过 OCR`);
-    return { mode: "ocr_text", pageCount, text: extractedText.fullText, source: "pdf_text" };
-  }
-
-  let pages;
-  try {
-    console.log(`[PDF] 开始 OCR: renderScale=${PDF_OCR_RENDER_SCALE}, pageConcurrency=${PDF_OCR_PAGE_CONCURRENCY}`);
-    pages = await mapWithConcurrency(
-      Array.from({ length: pageCount }, (_, index) => index + 1),
-      PDF_OCR_PAGE_CONCURRENCY,
-      async (pageNo) => {
-        const page = await doc.getPage(pageNo);
-        const pngBuffer = await renderPdfPageToPng(page, PDF_OCR_RENDER_SCALE);
-        console.log(`[PDF] 第 ${pageNo}/${pageCount} 页渲染完成: ${(pngBuffer.length / 1024).toFixed(1)}KB，开始 OCR...`);
-        const pageResult = await ocrImage(pngBuffer, pageNo);
-        console.log(`[PDF] 第 ${pageNo}/${pageCount} 页 OCR 完成: ${pageResult.text.length} 字`);
-        return pageResult;
-      }
-    );
-    console.log(`[PDF] OCR 完成，耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
-  } catch (e) {
-    console.log(`[PDF] OCR 调用失败: ${e.message}`);
-    throw new Error(`OCR 服务暂时不可用: ${e.message}`);
-  }
-
-  const fullText = pages.map(p => `## 第 ${p.page} 页\n\n${p.text}`).join("\n\n");
-  if (!fullText.trim()) {
-    return { mode: "ocr_text", pageCount, text: "(未能识别出文字内容)" };
-  }
-  return { mode: "ocr_text", pageCount, text: fullText };
+  return res.json();
 }
 // ============================
 
@@ -982,67 +778,51 @@ async function messageLoop() {
         console.log(`\n┌── [文件消息] ${fileItem.file_name} (${fileItem.len} bytes) ──`);
         try {
           const fileData = await downloadAndDecryptFile(fileItem);
-          const ext = fileData.fileName.split(".").pop()?.toLowerCase();
+          await sendMsgSafe(fromId, contextToken,
+            `已收到「${fileItem.file_name}」，正在解析，请稍候...`);
 
-          if (ext === "pdf") {
-            // 先发中间反馈（OCR 处理耗时）
+          const result = await parseDocumentFile(fileData);
+          if (result.mode === "image") {
+            pendingFiles.set(fromId, {
+              type: "image",
+              fileName: fileItem.file_name,
+              images: result.images,
+              timestamp: Date.now(),
+            });
             await sendMsgSafe(fromId, contextToken,
-              `已收到「${fileItem.file_name}」，正在处理，请稍候...`);
-
-            let result;
-            try {
-              result = await extractFromPdf(fileData.buffer);
-            } catch (e) {
-              console.log(`[PDF] 处理失败: ${e.message}`);
-              console.log(`[PDF] 错误栈: ${e.stack}`);
-              await sendMsgSafe(fromId, contextToken, `[Bot] PDF 处理失败: ${e.message}`);
-              continue;
-            }
-
-            if (result.mode === "image") {
+              `已收到「${fileItem.file_name}」（${result.pageCount}页），已转换为图片，请告诉我您的要求。`);
+          } else if (result.mode === "ocr_text") {
+            if (result.text === "(未能识别出文字内容)") {
+              await sendMsgSafe(fromId, contextToken,
+                `已收到「${fileItem.file_name}」（${result.pageCount}页），但未能识别出文字内容，可能是扫描质量较低或纯图片页面。`);
+            } else {
               pendingFiles.set(fromId, {
-                type: "image",
                 fileName: fileItem.file_name,
-                images: result.images,
+                text: result.text,
                 timestamp: Date.now(),
               });
+              const charCount = result.text.length;
+              const source = result.source === "pdf_text" ? "文本层提取" : "OCR识别";
               await sendMsgSafe(fromId, contextToken,
-                `已收到「${fileItem.file_name}」（${result.pageCount}页），已转换为图片，请告诉我您的要求。`);
-            } else if (result.mode === "ocr_text") {
-              if (result.text === "(未能识别出文字内容)") {
-                await sendMsgSafe(fromId, contextToken,
-                  `已收到「${fileItem.file_name}」（${result.pageCount}页），但未能识别出文字内容，可能是扫描质量较低或纯图片页面。`);
-              } else {
-                pendingFiles.set(fromId, {
-                  fileName: fileItem.file_name,
-                  text: result.text,
-                  timestamp: Date.now(),
-                });
-                const charCount = result.text.length;
-                await sendMsgSafe(fromId, contextToken,
-                  `已收到「${fileItem.file_name}」（${result.pageCount}页），OCR识别出约 ${charCount} 字内容，请告诉我您的要求。`);
-              }
-            } else {
-              await sendMsgSafe(fromId, contextToken,
-                `已收到「${fileItem.file_name}」（${result.pageCount}页），超过3页的PDF识别功能暂未配置OCR服务。`);
+                `已收到「${fileItem.file_name}」（${result.pageCount}页），${source}出约 ${charCount} 字内容，请告诉我您的要求。`);
             }
+          } else if (result.mode === "text" && result.text) {
+            pendingFiles.set(fromId, {
+              fileName: fileItem.file_name,
+              text: result.text,
+              timestamp: Date.now(),
+            });
+            const charCount = result.text.length;
+            const preview = result.text.slice(0, 50);
+            const reply = `已收到「${fileItem.file_name}」，解析出约 ${charCount} 字内容，开头预览：\n\n---\n${preview}${result.text.length > 200 ? "\n…(后续内容已就绪)" : ""}\n---\n\n请告诉我您的要求，我会结合文件内容一并处理。`;
+            console.log(`\n╔══ 文件内容（已暂存，等用户指令） ════════════════\n${result.text.slice(0, 500)}${result.text.length > 500 ? "...(截断)" : ""}\n──────────────────────────────────────────`);
+            await sendMsgSafe(fromId, contextToken, reply);
+          } else if (result.mode === "ocr_needed") {
+            await sendMsgSafe(fromId, contextToken,
+              `已收到「${fileItem.file_name}」（${result.pageCount}页），超过3页的PDF识别功能暂未配置OCR服务。`);
           } else {
-            const extracted = await extractTextFromFile(fileData);
-            if (extracted.text) {
-              pendingFiles.set(fromId, {
-                fileName: fileItem.file_name,
-                text: extracted.text,
-                timestamp: Date.now(),
-              });
-              const charCount = extracted.text.length;
-              const preview = extracted.text.slice(0, 50);
-              const reply = `已收到「${fileItem.file_name}」，解析出约 ${charCount} 字内容，开头预览：\n\n---\n${preview}${extracted.text.length > 200 ? "\n…(后续内容已就绪)" : ""}\n---\n\n请告诉我您的要求，我会结合文件内容一并处理。`;
-              console.log(`\n╔══ 文件内容（已暂存，等用户指令） ════════════════\n${extracted.text.slice(0, 500)}${extracted.text.length > 500 ? "...(截断)" : ""}\n──────────────────────────────────────────`);
-              await sendMsgSafe(fromId, contextToken, reply);
-            } else {
-              await sendMsgSafe(fromId, contextToken,
-                `[Bot] 收到文件 "${fileItem.file_name}"，但无法解析 .${extracted.type} 格式。目前支持: .docx, .txt, .pdf, .xlsx, .pptx`);
-            }
+            await sendMsgSafe(fromId, contextToken,
+              `[Bot] 收到文件 "${fileItem.file_name}"，但无法解析 .${result.type} 格式。目前支持: .docx, .txt, .pdf, .xlsx, .pptx`);
           }
         } catch (e) {
           console.log(`[文件] 处理失败: ${e.message}`);
@@ -1202,19 +982,20 @@ console.log(`
 // 0. 加载配置文件
 const botConfig = await loadOrCreateConfig();
 
-// 0.1 OCR 服务健康检查（非阻塞）
-if (botConfig.ocr_service_url) {
+// 0.1 文档解析服务健康检查（非阻塞）
+{
+  const documentServiceUrl = botConfig.document_service_url || DEFAULT_DOCUMENT_SERVICE_URL;
   try {
-    const hc = await fetch(`${botConfig.ocr_service_url}/health`, {
+    const hc = await fetch(`${documentServiceUrl}/health`, {
       signal: AbortSignal.timeout(5000),
     }).then(r => r.json());
     if (hc?.status === "ok") {
-      console.log(`[OCR] 服务健康检查通过: ${botConfig.ocr_service_url} (${hc.model})`);
+      console.log(`[Document] 服务健康检查通过: ${documentServiceUrl}`);
     } else {
-      console.log(`[OCR] 服务异常: ${JSON.stringify(hc)}`);
+      console.log(`[Document] 服务异常: ${JSON.stringify(hc)}`);
     }
   } catch (e) {
-    console.log(`[OCR] 服务健康检查失败（${e.message}），OCR 功能将不可用但 bot 主流程不受影响`);
+    console.log(`[Document] 服务健康检查失败（${e.message}），文件解析功能将不可用但 bot 主流程不受影响`);
   }
 }
 

@@ -7,6 +7,8 @@
 ```
 /opt/weixin-bot-ai/
 ├── bot.js                   # 主程序，所有实例共享
+├── document-service/         # Node 文档解析服务（PDF/Office，必要时调用 OCR）
+├── ocr-service/              # Python OCR 服务（图片 -> 文本）
 ├── package.json             # type: "module"，依赖 mammoth
 ├── node_modules/            # 共享依赖
 ├── ecosystem.config.cjs     # PM2 配置
@@ -22,6 +24,16 @@
 ```
 
 代码与配置分离：`bot.js` 一处修改，所有实例生效。每个实例目录只放 `config.json`，运行时自动生成 `session.json` 和 `logs/`。
+
+文件解析已经拆为独立服务：
+
+```text
+bot.js
+  -> 下载并解密微信文件
+  -> document-service /parse
+  -> PDF 扫描页按需调用 ocr-service /ocr/image
+  -> bot 暂存解析结果，等待用户下一条要求
+```
 
 ## 快速开始
 
@@ -59,6 +71,14 @@ vim instances/新用户/config.json   # 修改 API key、prompt 等
 pm2 start /opt/weixin-bot-ai/ecosystem.config.cjs --only weixin-bot-新用户
 ```
 
+文档解析和 OCR 服务：
+
+```bash
+pm2 start /opt/weixin-bot-ai/ecosystem.config.cjs --only ocr-service
+pm2 start /opt/weixin-bot-ai/ecosystem.config.cjs --only document-service
+curl http://127.0.0.1:8770/health
+```
+
 首次启动生成二维码，用微信扫码连接即可。
 
 ## 热更新
@@ -89,6 +109,13 @@ pm2 start /opt/weixin-bot-ai/ecosystem.config.cjs --only weixin-bot-新用户
 | model | 模型名 |
 | prompt | 系统提示词 |
 | scheduled_tasks | 定时任务（可选） |
+
+可选字段：
+
+| 字段 | 说明 |
+|------|------|
+| document_service_url | 文档解析服务地址，默认 `http://127.0.0.1:8770` |
+| ocr_service_url | 历史兼容字段；OCR 现在由 document-service 侧配置 |
 
 `scheduled_tasks` 支持两种 action：
 - `"text"` — 定时发送指定文字

@@ -1,1 +1,1 @@
-{"type":"module","scripts":{"ocr:benchmark":"node tools/ocr_benchmark.mjs"},"dependencies":{"@napi-rs/canvas":"^0.1.100","mammoth":"^1.12.0","node-pptx-parser":"^1.0.1","pdfjs-dist":"^5.7.284","xlsx":"^0.18.5"}}
+{"type":"module","scripts":{"document-service":"node document-service/server.js","ocr:benchmark":"node tools/ocr_benchmark.mjs"},"dependencies":{"@napi-rs/canvas":"^0.1.100","mammoth":"^1.12.0","node-pptx-parser":"^1.0.1","pdfjs-dist":"^5.7.284","xlsx":"^0.18.5"}}
