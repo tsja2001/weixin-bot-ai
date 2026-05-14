@@ -16,8 +16,10 @@ const COMMANDS_MSG = [
   "/help  /指令   - 查看全部指令列表",
   "/time          - 查询当前连接剩余时间",
   "/重新连接       - 立即触发重新连接（需确认）",
+  "/清空文件       - 清除当前对话中的文件上下文",
   "",
-  "非指令输入即为 AI 对话"
+  "非指令输入即为 AI 对话",
+  "上传文件后发送文字指令，AI 会结合文件内容处理；可连续上传多个文件",
 ].join("\n");
 
 // 自动重连配置
@@ -34,6 +36,12 @@ const HISTORY_MAX_TURNS = 10;           // 保留最近 N 轮对话
 const HISTORY_TTL_MS = 60 * 60 * 1000;  // 无活动多久后清空（毫秒）
 const HISTORY_MAX_CONTENT_LEN = 2000;   // 历史中单条消息最大字数
 const DEFAULT_DOCUMENT_SERVICE_URL = process.env.DOCUMENT_SERVICE_URL || "http://127.0.0.1:8770";
+
+// 文件锚点配置
+const FILE_ANCHOR_MAX_CHARS = 50000;       // 单文件锚点硬上限
+const FILE_ANCHOR_TOTAL_CHARS = 50000;     // 所有文件锚点总和上限
+const FILE_ANCHOR_MAX_TURNS = 10;          // 锚点保留轮数
+const FILE_ANCHOR_MAX_FILES = 5;           // 同时锚定文件数上限
 
 fs.mkdirSync("logs", { recursive: true });
 
@@ -317,8 +325,20 @@ let reconnectResolve = null;           // 定时器等待用户 Y 回复的 reso
 // ====================================
 
 // ========== 待处理文件（等待用户发来要求后一起传给AI）==========
-const pendingFiles = new Map();  // {fromId: {fileName, text, timestamp}}
-const PENDING_FILE_TTL_MS = 30 * 60 * 1000;  // 30 分钟未回复则清空
+const pendingFiles = new Map();  // fromId → { files: [{fileName, text, type?, images?, timestamp}], timestamp }
+const PENDING_FILE_TTL_MS = 12 * 60 * 60 * 1000;  // 12 小时未回复则清空
+
+// 文件锚点（文件内容持久化在对话历史中）
+const fileAnchors = new Map();  // fromId → [{ role: "user", content, turnCount }]
+
+function addPendingFile(fromId, fileEntry) {
+  let entry = pendingFiles.get(fromId);
+  if (!entry) {
+    entry = { files: [], timestamp: Date.now() };
+    pendingFiles.set(fromId, entry);
+  }
+  entry.files.push(fileEntry);
+}
 // ================================================================
 
 // ========== 对话上下文记忆 ==========
@@ -326,14 +346,24 @@ const conversationHistory = new Map();
 
 function getHistoryForUser(fromId) {
   const entry = conversationHistory.get(fromId);
-  if (!entry) return [];
-  // 超过 TTL 则清空，避免跨话题混淆
-  if (Date.now() - entry.lastActivity > HISTORY_TTL_MS) {
+  const anchors = fileAnchors.get(fromId) || [];
+
+  // 过滤过期锚点
+  const activeAnchors = anchors.filter(a => a.turnCount < FILE_ANCHOR_MAX_TURNS);
+  if (activeAnchors.length !== anchors.length) {
+    fileAnchors.set(fromId, activeAnchors);
+  }
+
+  if (!entry && activeAnchors.length === 0) return [];
+  if (entry && Date.now() - entry.lastActivity > HISTORY_TTL_MS) {
     conversationHistory.delete(fromId);
+    fileAnchors.delete(fromId);
     return [];
   }
-  entry.lastActivity = Date.now();
-  return entry.messages;
+
+  if (entry) entry.lastActivity = Date.now();
+  // 锚点在历史头部，确保文件内容始终可见
+  return [...activeAnchors, ...(entry?.messages || [])];
 }
 
 function addToHistory(fromId, userMsg, assistantReply) {
@@ -362,6 +392,49 @@ function addToHistory(fromId, userMsg, assistantReply) {
   if (entry.messages.length > maxMessages) {
     entry.messages = entry.messages.slice(-maxMessages);
   }
+}
+
+// 文件锚点两级截断
+function buildFileAnchors(files) {
+  // 第一级：单文件不超过 MAX_CHARS
+  const step1 = files.slice(0, FILE_ANCHOR_MAX_FILES).map(f => ({
+    ...f,
+    text: f.text.length > FILE_ANCHOR_MAX_CHARS
+      ? f.text.slice(0, FILE_ANCHOR_MAX_CHARS)
+      : f.text,
+  }));
+
+  // 第二级：总和不超过 TOTAL_CHARS
+  const totalChars = step1.reduce((sum, f) => sum + f.text.length, 0);
+  if (totalChars <= FILE_ANCHOR_TOTAL_CHARS) return step1;
+
+  const ratio = FILE_ANCHOR_TOTAL_CHARS / totalChars;
+  return step1.map(f => ({
+    ...f,
+    text: f.text.slice(0, Math.floor(f.text.length * ratio)),
+  }));
+}
+
+// 写入文件锚点并递增已有锚点 turnCount
+function upsertFileAnchors(fromId, newFiles) {
+  const anchors = fileAnchors.get(fromId) || [];
+
+  // 递增已有锚点轮数
+  for (const a of anchors) {
+    a.turnCount++;
+  }
+
+  // 追加新锚点
+  const truncated = buildFileAnchors(newFiles);
+  for (const f of truncated) {
+    anchors.push({
+      role: "user",
+      content: `[用户上传了文件: ${f.fileName}]\n\n${f.text}`,
+      turnCount: 0,
+    });
+  }
+
+  fileAnchors.set(fromId, anchors);
 }
 // ====================================
 
@@ -439,7 +512,8 @@ async function ensureTypingTicket(fromId, contextToken) {
 }
 
 // AI 回复完整流程：正在输入 → 调 AI → 发送 → 停止输入 → 记入历史
-async function sendAiReply(fromId, contextToken, userContent) {
+// pendingFilesForAnchor: 本轮处理过的文件列表，用于写入文件锚点
+async function sendAiReply(fromId, contextToken, userContent, pendingFilesForAnchor = null) {
   const ticket = await ensureTypingTicket(fromId, contextToken);
 
   // status=1 显示"正在输入..."
@@ -449,12 +523,18 @@ async function sendAiReply(fromId, contextToken, userContent) {
     }).catch(() => {});
   }
 
-  // 调用 AI
+  // 调用 AI（历史中已有旧文件锚点，新文件的锚点在 AI 回复后再写入）
   const history = getHistoryForUser(fromId);
   const reply = await callAI(userContent, botConfig, history);
   resetStatsIfNewDay();
   dailyStats.messageCount++;
   addToHistory(fromId, userContent, reply);
+
+  // AI 回复后再写入文件锚点，避免首轮消息中出现重复文件内容
+  if (pendingFilesForAnchor && pendingFilesForAnchor.length > 0) {
+    upsertFileAnchors(fromId, pendingFilesForAnchor);
+    console.log(`[文件锚点] 已写入 ${pendingFilesForAnchor.length} 个文件锚点，总字数=${pendingFilesForAnchor.reduce((s, f) => s + f.text.length, 0)}`);
+  }
 
   // 发送回复
   await sendMsgSafe(fromId, contextToken, reply);
@@ -875,25 +955,29 @@ async function messageLoop() {
               await sendMsgSafe(fromId, contextToken,
                 `已收到「${fileItem.file_name}」（${result.pageCount}页），但未能识别出文字内容，可能是扫描质量较低或纯图片页面。`);
             } else {
-              pendingFiles.set(fromId, {
+              addPendingFile(fromId, {
                 fileName: fileItem.file_name,
                 text: result.text,
                 timestamp: Date.now(),
               });
               const charCount = result.text.length;
+              const totalFiles = pendingFiles.get(fromId)?.files?.length || 0;
               const source = result.source === "pdf_text" ? "文本层提取" : "OCR识别";
+              const multiHint = totalFiles > 1 ? `（当前已暂存 ${totalFiles} 个文件）` : "";
               await sendMsgSafe(fromId, contextToken,
-                `已收到「${fileItem.file_name}」（${result.pageCount}页），${source}出约 ${charCount} 字内容，请告诉我您的要求。`);
+                `已收到「${fileItem.file_name}」（${result.pageCount}页），${source}出约 ${charCount} 字内容${multiHint}，请告诉我您的要求。`);
             }
           } else if (result.mode === "text" && result.text) {
-            pendingFiles.set(fromId, {
+            addPendingFile(fromId, {
               fileName: fileItem.file_name,
               text: result.text,
               timestamp: Date.now(),
             });
             const charCount = result.text.length;
+            const totalFiles = pendingFiles.get(fromId)?.files?.length || 0;
+            const multiHint = totalFiles > 1 ? `（当前已暂存 ${totalFiles} 个文件）` : "";
             const preview = result.text.slice(0, 50);
-            const reply = `已收到「${fileItem.file_name}」，解析出约 ${charCount} 字内容，开头预览：\n\n---\n${preview}${result.text.length > 200 ? "\n…(后续内容已就绪)" : ""}\n---\n\n请告诉我您的要求，我会结合文件内容一并处理。`;
+            const reply = `已收到「${fileItem.file_name}」，解析出约 ${charCount} 字内容${multiHint}，开头预览：\n\n---\n${preview}${result.text.length > 200 ? "\n…(后续内容已就绪)" : ""}\n---\n\n请告诉我您的要求，我会结合文件内容一并处理。`;
             console.log(`\n╔══ 文件内容（已暂存，等用户指令） ════════════════\n${result.text.slice(0, 500)}${result.text.length > 500 ? "...(截断)" : ""}\n──────────────────────────────────────────`);
             await sendMsgSafe(fromId, contextToken, reply);
           } else if (result.mode === "ocr_needed") {
@@ -924,7 +1008,7 @@ async function messageLoop() {
           } else {
             const base64 = imgBuf.toString("base64");
             const fileName = `图片_${Date.now()}.${mediaType.split("/")[1]}`;
-            pendingFiles.set(fromId, {
+            addPendingFile(fromId, {
               type: "image",
               fileName,
               images: [{ mediaType, base64 }],
@@ -1018,29 +1102,77 @@ async function messageLoop() {
         continue;
       }
 
-      // 5. 以上都不匹配 → AI 对话（检查是否有待处理的文件/图片）
-      const pendingFile = pendingFiles.get(fromId);
-      if (pendingFile) {
+      if (cmd === "/清空文件") {
+        const anchorCount = (fileAnchors.get(fromId) || []).length;
+        fileAnchors.delete(fromId);
         pendingFiles.delete(fromId);
-        // 检查 TTL，超时则忽略
-        if (Date.now() - pendingFile.timestamp > PENDING_FILE_TTL_MS) {
-          console.log(`[文件] ${fromId} 的待处理文件已超时，丢弃`);
+        await sendMsgSafe(fromId, contextToken,
+          anchorCount > 0
+            ? `已清除当前对话中的 ${anchorCount} 个文件上下文。`
+            : "当前没有文件上下文。");
+        continue;
+      }
+
+      // 5. 以上都不匹配 → AI 对话（检查是否有待处理的文件/图片）
+      const pendingEntry = pendingFiles.get(fromId);
+      if (pendingEntry && pendingEntry.files.length > 0) {
+        const allPending = pendingEntry.files;
+        pendingFiles.delete(fromId);
+
+        // 分离图片和文本文件
+        const imageFiles = allPending.filter(f => f.type === "image");
+        const textFiles = allPending.filter(f => !f.type || f.type !== "image");
+
+        // 检查最早文件是否超时
+        const oldestTs = Math.min(...allPending.map(f => f.timestamp));
+        if (Date.now() - oldestTs > PENDING_FILE_TTL_MS) {
+          console.log(`[文件] ${fromId} 的待处理文件已超时，丢弃 ${allPending.length} 个文件`);
           await sendAiReply(fromId, contextToken, text);
-        } else if (pendingFile.type === "image") {
+        } else if (textFiles.length === 0 && imageFiles.length === 1) {
+          // 单图片：走旧的 content blocks 路径
+          const img = imageFiles[0];
           const content = [
-            ...pendingFile.images.map(img => ({
+            ...img.images.map(img => ({
               type: "image",
               source: { type: "base64", media_type: img.mediaType, data: img.base64 }
             })),
-            { type: "text", text: `[用户上传了: ${pendingFile.fileName}]\n${text}` }
+            { type: "text", text: `[用户上传了: ${img.fileName}]\n${text}` }
           ];
-          console.log(`\n╔══ 合并图片+用户要求（传给AI） ══════════════\n图片=${pendingFile.fileName} 要求=${text.slice(0, 100)}\n──────────────────────────────────────────`);
+          console.log(`\n╔══ 合并图片+用户要求（传给AI） ══════════════\n图片=${img.fileName} 要求=${text.slice(0, 100)}\n──────────────────────────────────────────`);
           await sendAiReply(fromId, contextToken, content);
         } else {
-          // text 类型（向后兼容无 type 字段的旧 pending 数据）
-          const combined = `[用户之前发送了文件: ${pendingFile.fileName}]\n\n${pendingFile.text}\n\n[用户要求]\n${text}`;
-          console.log(`\n╔══ 合并文件+用户要求（传给AI） ══════════════\n文件=${pendingFile.fileName} 要求=${text.slice(0, 100)}\n──────────────────────────────────────────`);
-          await sendAiReply(fromId, contextToken, combined);
+          // 有文本文件（可能混合图片）：构建多文件合并消息
+          let combined = "";
+          const fileNames = [];
+
+          if (textFiles.length > 0) {
+            const fileLabel = textFiles.length === 1 ? "文件" : `${textFiles.length} 个文件`;
+            combined += `[用户之前发送了以下 ${fileLabel}]\n\n`;
+            for (let i = 0; i < textFiles.length; i++) {
+              combined += `${"=".repeat(40)}\n`;
+              combined += `文件${i + 1}: ${textFiles[i].fileName}\n`;
+              combined += `${"=".repeat(40)}\n`;
+              combined += textFiles[i].text + "\n\n";
+              fileNames.push(textFiles[i].fileName);
+            }
+          }
+          combined += `[用户要求]\n${text}`;
+
+          console.log(`\n╔══ 合并 ${textFiles.length} 文件 + 用户要求（传给AI） ══════════════\n文件=${fileNames.join(", ")} 要求=${text.slice(0, 100)}\n──────────────────────────────────────────`);
+
+          // 图片作为 content blocks 拼入
+          if (imageFiles.length > 0) {
+            const content = [
+              ...imageFiles.flatMap(f => f.images.map(img => ({
+                type: "image",
+                source: { type: "base64", media_type: img.mediaType, data: img.base64 }
+              }))),
+              { type: "text", text: combined }
+            ];
+            await sendAiReply(fromId, contextToken, content, textFiles);
+          } else {
+            await sendAiReply(fromId, contextToken, combined, textFiles);
+          }
         }
       } else {
         await sendAiReply(fromId, contextToken, text);
