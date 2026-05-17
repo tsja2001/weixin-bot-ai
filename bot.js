@@ -7,6 +7,7 @@ const BASE_URL = "https://ilinkai.weixin.qq.com";
 const CONFIG_FILE = "config.json";
 const SESSION_FILE = "session.json";
 const DEBUG_LOG_FILE = "logs/debug_messages.jsonl";
+const PROMPT_FILE = "promt.md";
 const DEFAULT_PROMPT = "你是一个有帮助的AI助手，请用中文简洁地回复。字数尽量少一些";
 
 // 欢迎消息（首次连接或 /help 时发送）
@@ -275,11 +276,21 @@ async function loadOrCreateConfig() {
       const cfg = { api_key: apiKey, base_url: baseUrl, model, prompt };
       fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), "utf-8");
       console.log(`\n配置已保存到 ${CONFIG_FILE}\n`);
+      // 如果存在 promt.md 则覆盖交互式输入的 prompt
+      if (fs.existsSync(PROMPT_FILE)) {
+        const filePrompt = fs.readFileSync(PROMPT_FILE, "utf-8").trim();
+        if (filePrompt) cfg.prompt = filePrompt;
+      }
       return cfg;
     }
 
     // 已有配置文件
     const cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf-8"));
+    // 优先从 prompt.md 加载提示词，fallback 到 config 中的 prompt 字段
+    if (fs.existsSync(PROMPT_FILE)) {
+      const filePrompt = fs.readFileSync(PROMPT_FILE, "utf-8").trim();
+      if (filePrompt) cfg.prompt = filePrompt;
+    }
     console.log(`\n${sep}`);
     console.log("  检测到配置文件，当前配置如下：");
     console.log(sep);
@@ -287,7 +298,8 @@ async function loadOrCreateConfig() {
     console.log(`  API 地址 : ${cfg.base_url ?? ""}`);
     console.log(`  模型     : ${cfg.model ?? ""}`);
     const p = cfg.prompt ?? "";
-    console.log(`  提示词   : ${p.slice(0, 50)}${p.length > 50 ? "..." : ""}`);
+    const promptSource = fs.existsSync(PROMPT_FILE) ? PROMPT_FILE : "config.json";
+    console.log(`  提示词   : ${p.slice(0, 50)}${p.length > 50 ? "..." : ""}  (来源: ${promptSource})`);
     console.log(dash);
 
     // 非交互式环境自动使用已有配置
