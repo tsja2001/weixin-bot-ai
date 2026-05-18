@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import fs from "fs";
 import readline from "readline";
+import { init as initScheduler, loop as schedulerLoop } from "./scheduler.js";
 
 // ========== 常量 ==========
 const BASE_URL = "https://ilinkai.weixin.qq.com";
@@ -575,6 +576,10 @@ async function callAI(userContent, config, history = []) {
     ? { role: "user", content: userContent }
     : { role: "user", content: userContent };
 
+  const contentLen = typeof userContent === "string"
+    ? userContent.length
+    : JSON.stringify(userContent).length;
+
   const payload = {
     model: config.model,
     max_tokens: 4096,
@@ -582,13 +587,14 @@ async function callAI(userContent, config, history = []) {
     messages: [...history, userMessage],
   };
 
+  const url = `${config.base_url}/v1/messages`;
   const retryDelays = [2, 4, 8, 16, 32]; // 秒
   const maxRetries = 5;
   let lastError;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      const res = await fetch(`${config.base_url}/v1/messages`, {
+      const res = await fetch(url, {
         method: "POST",
         headers,
         body: JSON.stringify(payload),
@@ -596,19 +602,28 @@ async function callAI(userContent, config, history = []) {
       });
 
       if (!res.ok) {
-        const errText = await res.text().catch(() => "");
-        throw new Error(`HTTP ${res.status}: ${errText.slice(0, 200)}`);
+        const errBody = await res.text().catch(() => "(无法读取响应体)");
+        const diag = [];
+        for (const k of ["x-request-id", "content-type", "retry-after", "date", "x-should-retry", "x-ratelimit-reset-request"]) {
+          const v = res.headers.get(k);
+          if (v) diag.push(`${k}=${v}`);
+        }
+        console.log(`[AI] HTTP ${res.status} — ${diag.join(" ") || "无诊断头"}`);
+        console.log(`[AI] 响应体: ${errBody.slice(0, 2000)}`);
+        throw new Error(`HTTP ${res.status}`);
       }
 
       const data = await res.json();
       const text = data.content?.[0]?.text;
-      if (!text) throw new Error("响应中未找到文本内容");
+      if (!text) {
+        console.log(`[AI] 响应无文本，完整 JSON: ${JSON.stringify(data).slice(0, 2000)}`);
+        throw new Error("响应中未找到文本内容");
+      }
 
       if (attempt > 0) {
         console.log(`[AI] 第 ${attempt} 次重试成功: ${text.slice(0, 80)}...`);
       }
 
-      // 累计 token 消耗
       if (data.usage) {
         dailyStats.inputTokens += data.usage.input_tokens ?? data.usage.prompt_tokens ?? 0;
         dailyStats.outputTokens += data.usage.output_tokens ?? data.usage.completion_tokens ?? 0;
@@ -624,7 +639,20 @@ async function callAI(userContent, config, history = []) {
       }
     }
   }
-  console.log(`[AI] 已重试 ${maxRetries} 次，最终失败: ${lastError.message}`);
+
+  // 最终失败 — 输出完整诊断信息
+  const errCode = lastError?.cause?.code || lastError?.code || "";
+  const errName = lastError?.name || "";
+  console.log(`[AI] 已重试 ${maxRetries} 次，最终失败:`);
+  console.log(`[AI]   URL: ${url}`);
+  console.log(`[AI]   Model: ${config.model}`);
+  console.log(`[AI]   消息长度: ${contentLen} 字符`);
+  console.log(`[AI]   错误名: ${errName}${errCode ? ", 底层码: " + errCode : ""}`);
+  console.log(`[AI]   错误信息: ${lastError?.message || "(无)"}`);
+  if (lastError?.cause?.message && lastError.cause.message !== lastError?.message) {
+    console.log(`[AI]   底层错误: ${lastError.cause.message}`);
+  }
+
   return "AI 接口暂时不可用，请稍后再试。";
 }
 // =================================
@@ -754,97 +782,6 @@ async function reconnectTimerLoop() {
     }
   }
 }
-// ===============================
-
-// ========== 定时任务调度器 ==========
-// 从 config.json 的 scheduled_tasks 读取任务列表
-// 任务格式: { time: "08:45", action: "text"|"daily_report", content: "..." }
-//   text         — 直接发送 content 字符串
-//   daily_report — 发送当日消息数+token 统计
-
-function parseTimeToMs(timeStr) {
-  const [h, m] = timeStr.split(":").map(Number);
-  return (h * 60 + m) * 60 * 1000;
-}
-
-function getMsUntilNext(targetMsFromMidnight) {
-  const now = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Shanghai" }));
-  const midnight = new Date(now);
-  midnight.setHours(0, 0, 0, 0);
-  const nowMs = now - midnight;
-  let diff = targetMsFromMidnight - nowMs;
-  if (diff <= 0) diff += 24 * 60 * 60 * 1000;
-  return diff;
-}
-
-async function executeScheduledTask(task) {
-  console.log(`[调度] 执行任务: ${task.time} ${task.action}`);
-  const { fromId, contextToken } = lastContact;
-  if (!fromId || !contextToken) {
-    console.log("[调度] 无可用联系人，跳过发送");
-    return;
-  }
-
-  switch (task.action) {
-    case "text":
-      await sendMsgSafe(fromId, contextToken, task.content);
-      break;
-    case "daily_report":
-      resetStatsIfNewDay();
-      {
-        const today = dailyStats.date;
-        const report = [
-          `[每日报告] ${today}`,
-          `消息数：${dailyStats.messageCount} 条`,
-          `输入 token：${dailyStats.inputTokens.toLocaleString()}`,
-          `输出 token：${dailyStats.outputTokens.toLocaleString()}`,
-          `合计 token：${(dailyStats.inputTokens + dailyStats.outputTokens).toLocaleString()}`,
-        ].join("\n");
-        console.log(report);
-        await sendMsgSafe(fromId, contextToken, report);
-        dailyStats.messageCount = 0;
-        dailyStats.inputTokens = 0;
-        dailyStats.outputTokens = 0;
-      }
-      break;
-    default:
-      console.log(`[调度] 未知任务类型: ${task.action}`);
-  }
-}
-
-async function schedulerLoop() {
-  const tasks = botConfig.scheduled_tasks;
-  if (!tasks || tasks.length === 0) {
-    console.log("[调度] 未配置定时任务，调度器休眠");
-    while (true) await sleep(24 * 60 * 60 * 1000);
-  }
-
-  while (true) {
-    let minWait = Infinity;
-    let nextTask = null;
-
-    for (const task of tasks) {
-      const targetMs = parseTimeToMs(task.time);
-      const wait = getMsUntilNext(targetMs);
-      if (wait < minWait) { minWait = wait; nextTask = task; }
-    }
-
-    const nextTime = new Date(Date.now() + minWait).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
-    console.log(`[调度] 下一个任务: ${nextTask.time} (${nextTask.action}), 预计 ${nextTime}`);
-    await sleep(minWait);
-
-    // 同时刻的任务一起执行
-    const now = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Shanghai" }));
-    const currentTimeStr = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
-    for (const task of tasks) {
-      if (task.time === currentTimeStr) {
-        await executeScheduledTask(task);
-      }
-    }
-  }
-}
-// ===================================
-
 // ========== 消息处理主循环 ==========
 async function messageLoop() {
   console.log("开始监听消息...");
@@ -1204,6 +1141,14 @@ console.log(`
 
 // 0. 加载配置文件
 const botConfig = await loadOrCreateConfig();
+
+// 0.1 初始化调度器模块
+initScheduler(botConfig, {
+  getLastContact: () => lastContact,
+  sendMsg: sendMsgSafe,
+  callAI,
+  dailyStats,
+});
 
 // 0.1 文档解析服务健康检查（非阻塞）
 {
