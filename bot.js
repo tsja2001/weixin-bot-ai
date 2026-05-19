@@ -2,6 +2,14 @@ import crypto from "crypto";
 import fs from "fs";
 import readline from "readline";
 import { init as initScheduler, loop as schedulerLoop } from "./scheduler.js";
+import { isLocalEnabled, isLocalId, drainLocalInbox, onLocalInboxReady,
+         deliverToLocal, initLocalChannel, snapshotForProbe } from "./local-channel/index.js";
+import {
+  HISTORY_MAX_TURNS, HISTORY_TTL_MS, HISTORY_MAX_CONTENT_LEN,
+  FILE_ANCHOR_MAX_CHARS, FILE_ANCHOR_TOTAL_CHARS, FILE_ANCHOR_MAX_TURNS, FILE_ANCHOR_MAX_FILES,
+  PENDING_FILE_TTL_MS, RECONNECT_CONFIG, DEFAULT_DOCUMENT_SERVICE_URL,
+  COMMANDS_MSG, DEFAULT_PROMPT,
+} from "./constants.js";
 
 // ========== 常量 ==========
 const BASE_URL = "https://ilinkai.weixin.qq.com";
@@ -9,41 +17,7 @@ const CONFIG_FILE = "config.json";
 const SESSION_FILE = "session.json";
 const DEBUG_LOG_FILE = "logs/debug_messages.jsonl";
 const PROMPT_FILE = "promt.md";
-const DEFAULT_PROMPT = "你是一个有帮助的AI助手，请用中文简洁地回复。字数尽量少一些";
-
-// 欢迎消息（首次连接或 /help 时发送）
-const COMMANDS_MSG = [
-  "连接成功！",
-  "可用指令：",
-  "/help  /指令   - 查看全部指令列表",
-  "/time          - 查询当前连接剩余时间",
-  "/重新连接       - 立即触发重新连接（需确认）",
-  "/清空文件       - 清除当前对话中的文件上下文",
-  "",
-  "非指令输入即为 AI 对话",
-  "上传文件后发送文字指令，AI 会结合文件内容处理；可连续上传多个文件",
-].join("\n");
-
-// 自动重连配置
-const RECONNECT_CONFIG = {
-  session_duration:    24 * 3600,  // 会话总时长（秒）
-  warning_before:       2 * 3600,  // 提前多久发出警告
-  reminder_interval:      30 * 60, // 用户回 N 后多久再问
-  force_before:           30 * 60, // 最后多久强制重连
-  qrcode_scan_timeout:       600,  // 等待扫码超时
-};
-
-// 对话记忆配置
-const HISTORY_MAX_TURNS = 10;           // 保留最近 N 轮对话
-const HISTORY_TTL_MS = 60 * 60 * 1000;  // 无活动多久后清空（毫秒）
-const HISTORY_MAX_CONTENT_LEN = 2000;   // 历史中单条消息最大字数
-const DEFAULT_DOCUMENT_SERVICE_URL = process.env.DOCUMENT_SERVICE_URL || "http://127.0.0.1:8770";
-
-// 文件锚点配置
-const FILE_ANCHOR_MAX_CHARS = 50000;       // 单文件锚点硬上限
-const FILE_ANCHOR_TOTAL_CHARS = 50000;     // 所有文件锚点总和上限
-const FILE_ANCHOR_MAX_TURNS = 10;          // 锚点保留轮数
-const FILE_ANCHOR_MAX_FILES = 5;           // 同时锚定文件数上限
+// 常量已移至 constants.js（bot.js 与测试共享），通过顶部 import 引用
 
 fs.mkdirSync("logs", { recursive: true });
 
@@ -88,6 +62,7 @@ function maskKey(key) {
 }
 
 function saveSession() {
+  if (isLocalEnabled()) return;
   try {
     fs.writeFileSync(SESSION_FILE, JSON.stringify({
       botToken, botBaseUrl, loginTime, getUpdatesBuf
@@ -122,6 +97,11 @@ function rlQuestion(rl, q) {
 // ========== 文件下载解密 + 文本提取 ==========
 // 通用媒体下载+解密（图片/文件共用）
 async function downloadAndDecryptMedia(media, label, expectedMd5) {
+  if (media && Object.prototype.hasOwnProperty.call(media, "_local_path")) {
+    const buf = fs.readFileSync(media._local_path);
+    console.log(`[LOCAL 媒体] 读取 ${media._local_path} (${buf.length} bytes)`);
+    return buf;
+  }
   const { full_url, aes_key, encrypt_query_param } = media;
 
   const url = full_url || `https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=${encodeURIComponent(encrypt_query_param)}`;
@@ -339,7 +319,7 @@ let reconnectResolve = null;           // 定时器等待用户 Y 回复的 reso
 
 // ========== 待处理文件（等待用户发来要求后一起传给AI）==========
 const pendingFiles = new Map();  // fromId → { files: [{fileName, text, type?, images?, timestamp}], timestamp }
-const PENDING_FILE_TTL_MS = 12 * 60 * 60 * 1000;  // 12 小时未回复则清空
+// PENDING_FILE_TTL_MS 从 constants.js 导入
 
 // 文件锚点（文件内容持久化在对话历史中）
 const fileAnchors = new Map();  // fromId → [{ role: "user", content, turnCount }]
@@ -493,6 +473,11 @@ async function sendMsgSafe(toId, contextToken, text) {
     console.log(`[发送] 缺少 toId 或 contextToken，仅打印: ${text}`);
     return;
   }
+  if (isLocalId(toId)) {
+    deliverToLocal({ kind: "message", to_user_id: toId, context_token: contextToken, text });
+    console.log(`[LOCAL 出站] → ${toId}: ${text.slice(0, 80)}`);
+    return;
+  }
   try {
     const clientId = `openclaw-weixin-${Math.floor(Math.random() * 0xFFFFFFFF).toString(16).padStart(8, "0")}`;
     await apiPost("ilink/bot/sendmessage", {
@@ -514,6 +499,7 @@ async function sendMsgSafe(toId, contextToken, text) {
 
 // 获取 typing_ticket（每个用户首次调用后缓存）
 async function ensureTypingTicket(fromId, contextToken) {
+  if (isLocalId(fromId)) return "LOCAL_TICKET";
   if (!typingTicketCache[fromId]) {
     const cfg = await apiPost("ilink/bot/getconfig", {
       ilink_user_id: fromId, context_token: contextToken,
@@ -530,7 +516,9 @@ async function sendAiReply(fromId, contextToken, userContent, pendingFilesForAnc
   const ticket = await ensureTypingTicket(fromId, contextToken);
 
   // status=1 显示"正在输入..."
-  if (ticket) {
+  if (isLocalId(fromId)) {
+    deliverToLocal({ kind: "typing", to_user_id: fromId, status: 1 });
+  } else if (ticket) {
     await apiPost("ilink/bot/sendtyping", {
       ilink_user_id: fromId, typing_ticket: ticket, status: 1
     }).catch(() => {});
@@ -538,6 +526,15 @@ async function sendAiReply(fromId, contextToken, userContent, pendingFilesForAnc
 
   // 调用 AI（历史中已有旧文件锚点，新文件的锚点在 AI 回复后再写入）
   const history = getHistoryForUser(fromId);
+  const contentLen = typeof userContent === "string"
+    ? userContent.length
+    : JSON.stringify(userContent).length;
+  const LARGE_CONTENT_THRESHOLD = 20000;
+  if (contentLen > LARGE_CONTENT_THRESHOLD) {
+    const kb = (contentLen / 1000).toFixed(1);
+    const waitHint = `内容较大（约 ${kb} KB），回复需要较长时间，请耐心等待...`;
+    await sendMsgSafe(fromId, contextToken, waitHint);
+  }
   const reply = await callAI(userContent, botConfig, history);
   resetStatsIfNewDay();
   dailyStats.messageCount++;
@@ -554,7 +551,9 @@ async function sendAiReply(fromId, contextToken, userContent, pendingFilesForAnc
   console.log(`\n╔══ AI 回复 ══════════════════════════════════\n${reply}\n──────────────────────────────────────────`);
 
   // status=2 取消"正在输入..."
-  if (ticket) {
+  if (isLocalId(fromId)) {
+    deliverToLocal({ kind: "typing", to_user_id: fromId, status: 2 });
+  } else if (ticket) {
     await apiPost("ilink/bot/sendtyping", {
       ilink_user_id: fromId, typing_ticket: ticket, status: 2
     }).catch(() => {});
@@ -598,7 +597,7 @@ async function callAI(userContent, config, history = []) {
         method: "POST",
         headers,
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(60000),
+        signal: AbortSignal.timeout(180000),
       });
 
       if (!res.ok) {
@@ -790,26 +789,34 @@ async function messageLoop() {
   while (true) {
     // ── 长轮询获取消息 ──
     let result;
-    try {
-      result = await apiPost(
-        "ilink/bot/getupdates",
-        { get_updates_buf: getUpdatesBuf, base_info: { channel_version: "1.0.2" } }
-      );
-      consecutiveFailures = 0;
-    } catch (e) {
-      consecutiveFailures++;
-      console.log(`[消息循环] getupdates 失败 (${consecutiveFailures}/5): ${e.message}`);
-      if (consecutiveFailures >= 5) {
-        console.log("[消息循环] 连续失败 5 次，尝试重连...");
-        await doReconnect();
+    if (isLocalEnabled()) {
+      // 本地测试实例：不调微信 getupdates，等待本地 inbox 信号
+      await onLocalInboxReady({ timeout_ms: 35000 });
+      result = { msgs: [], get_updates_buf: getUpdatesBuf };
+    } else {
+      try {
+        result = await apiPost(
+          "ilink/bot/getupdates",
+          { get_updates_buf: getUpdatesBuf, base_info: { channel_version: "1.0.2" } }
+        );
         consecutiveFailures = 0;
+      } catch (e) {
+        consecutiveFailures++;
+        console.log(`[消息循环] getupdates 失败 (${consecutiveFailures}/5): ${e.message}`);
+        if (consecutiveFailures >= 5) {
+          console.log("[消息循环] 连续失败 5 次，尝试重连...");
+          await doReconnect();
+          consecutiveFailures = 0;
+        }
+        await sleep(5000);
+        continue;
       }
-      await sleep(5000);
-      continue;
     }
 
     getUpdatesBuf = result.get_updates_buf ?? getUpdatesBuf;
-    const msgs = result.msgs ?? [];
+    const wechatMsgs = result.msgs ?? [];
+    const localMsgs = isLocalEnabled() ? drainLocalInbox() : [];
+    const msgs = [...wechatMsgs, ...localMsgs];
 
     if (msgs.length > 0) {
       const types = msgs.map(m => `msg_type=${m.message_type} items=[${(m.item_list || []).map(i => i.type).join(",")}]`);
@@ -1167,7 +1174,27 @@ initScheduler(botConfig, {
   }
 }
 
-// 1. 尝试恢复登录态，有效则跳过扫码
+// 1. 尝试恢复登录态，有效则跳过扫码（本地测试实例跳过）
+if (isLocalEnabled()) {
+  botToken = "LOCAL_TEST_TOKEN";
+  botBaseUrl = "http://127.0.0.1:0";
+  loginTime = Date.now();
+  initLocalChannel({
+    port: Number(process.env.LOCAL_TEST_PORT),
+    snapshotForProbe: (userId) => snapshotForProbe(userId, {
+      pendingFiles, fileAnchors, conversationHistory,
+      typingTicketCache, dailyStats, welcomedUsers, lastContact,
+    }),
+    resetUser: (userId) => {
+      pendingFiles.delete(userId);
+      fileAnchors.delete(userId);
+      conversationHistory.delete(userId);
+      typingTicketCache[userId] && delete typingTicketCache[userId];
+      welcomedUsers.delete(userId);
+    },
+  });
+  console.log(`[LOCAL] 测试通道已启用 :${process.env.LOCAL_TEST_PORT}`);
+} else {
 const savedSession = loadSession();
 if (savedSession) {
   botToken = savedSession.botToken;
@@ -1222,6 +1249,10 @@ if (savedSession) {
   }
 }
 
+} // isLocalEnabled else 块结束
+
 // 4. 并发启动消息循环 + 重连定时器 + 调度器
 if (!loginTime) loginTime = Date.now();
-await Promise.all([messageLoop(), reconnectTimerLoop(), schedulerLoop()]);
+const tasks = [messageLoop(), schedulerLoop()];
+if (!isLocalEnabled()) tasks.push(reconnectTimerLoop());
+await Promise.all(tasks);
