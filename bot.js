@@ -1254,5 +1254,5 @@ if (savedSession) {
 // 4. 并发启动消息循环 + 重连定时器 + 调度器
 if (!loginTime) loginTime = Date.now();
 const tasks = [messageLoop(), schedulerLoop()];
-if (!isLocalEnabled()) tasks.push(reconnectTimerLoop());
+if (!isLocalEnabled() && RECONNECT_CONFIG.timer_enabled) tasks.push(reconnectTimerLoop());
 await Promise.all(tasks);

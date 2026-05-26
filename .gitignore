@@ -25,5 +25,10 @@ __pycache__/
 venv/
 .venv/
 
+# 本地测试通道
+fixtures/
+instances/test-local/
+tests/reports/
+
 # macOS
 .DS_Store

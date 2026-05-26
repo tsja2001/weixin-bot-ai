@@ -194,3 +194,44 @@ bot.js 使用模块级变量（非 class），在消息循环和重连定时器�
 - `ecosystem.config.cjs` 必须用 `.cjs` 扩展名（根 `package.json` 声明了 `"type": "module"`）
 - 仅依赖 `mammoth`，纯 JS 实现，跨平台无编译问题
 - PM2 配置修改后需 `pm2 start` 而非 `pm2 restart`
+
+## 测试
+
+### 本地 HTTP 测试通道
+
+通过 `LOCAL_TEST_PORT` 环境变量启用。详情见 `local-channel/README.md`。
+
+测试套件位于 `tests/` 目录，使用 Node.js 内置 `node:test` 模块：
+- `tests/lib/constants.js` — 从根 `constants.js` 导入，确保测试与代码共享同一套业务常量
+- `tests/lib/bot-process.js` — 启动/停止本地测试实例
+- `tests/lib/client.js` — HTTP 客户端封装（inbox/outbox/state/reset）
+- `tests/lib/reporter.js` — JSON 测试报告生成
+- `tests/scenarios/` — 按功能模块组织的测试文件
+
+### 修改逻辑后必须跑测试
+
+任何修改业务逻辑或常量值后：
+1. 运行 `node tests/runner.js`
+2. 有测试失败时逐个分析：
+   - 测试过时（行为有意变更导致）→ 更新测试代码
+   - 代码写错导致 → 修复代码
+3. 新增行为同时新增测试用例
+4. 全部通过后才能提交
+
+### 测试里不写死魔法数字
+
+测试应该从 `constants.js` 导入业务常量，或用相对值表达意图（如"明显超过限制"），不应该硬编码 `50000`、`10` 等魔法数字。
+
+### 新增测试文件
+
+在 `tests/scenarios/` 下添加 `NN-场景描述.test.js`，文件名编号递增。每个文件导出一个 `{ name, description, tests }` 对象。
+
+### 测试模式
+
+```
+1. POST /local/inbox/... 注入消息
+2. GET /local/outbox?since=N&wait_ms=... 长轮询等回复
+3. assert 断言结果
+4. POST /local/reset 清理状态
+5. 下一个用例
+```
