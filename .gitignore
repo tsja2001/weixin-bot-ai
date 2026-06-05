@@ -1,5 +1,6 @@
 # 配置文件（含 API key，绝不可提交）
 config.json
+config.json(openrouter)
 session.json
 instances/*/config.json
 instances/*/session.json
