@@ -2,11 +2,19 @@ import crypto from "crypto";
 import fs from "fs";
 import readline from "readline";
 import { init as initScheduler, loop as schedulerLoop } from "./scheduler.js";
+import { initFeishuSummary, recordChatTurn } from "./feishu-summary/index.js";
 import { isLocalEnabled, isLocalId, drainLocalInbox, onLocalInboxReady,
          deliverToLocal, initLocalChannel, snapshotForProbe } from "./local-channel/index.js";
+import { callClaude, normalizeUsage } from "./lib/ai-client.js";
+import { selectContext } from "./secretary.js";
+import { buildRequest } from "./context-builder.js";
+import { loadMemory, saveMemory, touchProfile } from "./memory/store.js";
+import { extractAndSaveMemory } from "./memory/extract.js";
+import {
+  ageFileAnchors, selectFilesByIds, upsertFileAnchors as upsertFileContextAnchors,
+} from "./file-context.js";
 import {
   HISTORY_MAX_TURNS, HISTORY_TTL_MS, HISTORY_MAX_CONTENT_LEN,
-  FILE_ANCHOR_MAX_CHARS, FILE_ANCHOR_TOTAL_CHARS, FILE_ANCHOR_MAX_TURNS, FILE_ANCHOR_MAX_FILES,
   PENDING_FILE_TTL_MS, RECONNECT_CONFIG, DEFAULT_DOCUMENT_SERVICE_URL,
   COMMANDS_MSG, DEFAULT_PROMPT,
 } from "./constants.js";
@@ -262,11 +270,18 @@ async function loadOrCreateConfig() {
         const filePrompt = fs.readFileSync(PROMPT_FILE, "utf-8").trim();
         if (filePrompt) cfg.prompt = filePrompt;
       }
+      cfg.memory = { enabled: false, ...(cfg.memory || {}) };
+      cfg.secretary = { enabled: false, ...(cfg.secretary || {}) };
+      cfg.prompt_cache = { enabled: false, ...(cfg.prompt_cache || {}) };
       return cfg;
     }
 
     // 已有配置文件
     const cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf-8"));
+    if (process.env.ROUTER_BASE_URL) cfg.router_base_url = process.env.ROUTER_BASE_URL;
+    cfg.memory = { enabled: false, ...(cfg.memory || {}) };
+    cfg.secretary = { enabled: false, ...(cfg.secretary || {}) };
+    cfg.prompt_cache = { enabled: false, ...(cfg.prompt_cache || {}) };
     // 优先从 prompt.md 加载提示词，fallback 到 config 中的 prompt 字段
     if (fs.existsSync(PROMPT_FILE)) {
       const filePrompt = fs.readFileSync(PROMPT_FILE, "utf-8").trim();
@@ -321,8 +336,11 @@ let reconnectResolve = null;           // 定时器等待用户 Y 回复的 reso
 const pendingFiles = new Map();  // fromId → { files: [{fileName, text, type?, images?, timestamp}], timestamp }
 // PENDING_FILE_TTL_MS 从 constants.js 导入
 
-// 文件锚点（文件内容持久化在对话历史中）
-const fileAnchors = new Map();  // fromId → [{ role: "user", content, turnCount }]
+// 文件上下文锚点（本轮由秘书选择是否注入 Claude）
+const fileAnchors = new Map();  // fromId → [{ id, fileName, content, idleTurns }]
+const lastRouting = new Map();
+const lastRequestMeta = new Map();
+const lastUsage = new Map();
 
 function addPendingFile(fromId, fileEntry) {
   let entry = pendingFiles.get(fromId);
@@ -339,15 +357,8 @@ const conversationHistory = new Map();
 
 function getHistoryForUser(fromId) {
   const entry = conversationHistory.get(fromId);
-  const anchors = fileAnchors.get(fromId) || [];
 
-  // 过滤过期锚点
-  const activeAnchors = anchors.filter(a => a.turnCount < FILE_ANCHOR_MAX_TURNS);
-  if (activeAnchors.length !== anchors.length) {
-    fileAnchors.set(fromId, activeAnchors);
-  }
-
-  if (!entry && activeAnchors.length === 0) return [];
+  if (!entry) return [];
   if (entry && Date.now() - entry.lastActivity > HISTORY_TTL_MS) {
     conversationHistory.delete(fromId);
     fileAnchors.delete(fromId);
@@ -355,8 +366,7 @@ function getHistoryForUser(fromId) {
   }
 
   if (entry) entry.lastActivity = Date.now();
-  // 锚点在历史头部，确保文件内容始终可见
-  return [...activeAnchors, ...(entry?.messages || [])];
+  return entry?.messages || [];
 }
 
 function addToHistory(fromId, userMsg, assistantReply) {
@@ -387,48 +397,6 @@ function addToHistory(fromId, userMsg, assistantReply) {
   }
 }
 
-// 文件锚点两级截断
-function buildFileAnchors(files) {
-  // 第一级：单文件不超过 MAX_CHARS
-  const step1 = files.slice(0, FILE_ANCHOR_MAX_FILES).map(f => ({
-    ...f,
-    text: f.text.length > FILE_ANCHOR_MAX_CHARS
-      ? f.text.slice(0, FILE_ANCHOR_MAX_CHARS)
-      : f.text,
-  }));
-
-  // 第二级：总和不超过 TOTAL_CHARS
-  const totalChars = step1.reduce((sum, f) => sum + f.text.length, 0);
-  if (totalChars <= FILE_ANCHOR_TOTAL_CHARS) return step1;
-
-  const ratio = FILE_ANCHOR_TOTAL_CHARS / totalChars;
-  return step1.map(f => ({
-    ...f,
-    text: f.text.slice(0, Math.floor(f.text.length * ratio)),
-  }));
-}
-
-// 写入文件锚点并递增已有锚点 turnCount
-function upsertFileAnchors(fromId, newFiles) {
-  const anchors = fileAnchors.get(fromId) || [];
-
-  // 递增已有锚点轮数
-  for (const a of anchors) {
-    a.turnCount++;
-  }
-
-  // 追加新锚点
-  const truncated = buildFileAnchors(newFiles);
-  for (const f of truncated) {
-    anchors.push({
-      role: "user",
-      content: `[用户上传了文件: ${f.fileName}]\n\n${f.text}`,
-      turnCount: 0,
-    });
-  }
-
-  fileAnchors.set(fromId, anchors);
-}
 // ====================================
 
 // ========== iLink Bot API 封装 ==========
@@ -510,9 +478,28 @@ async function ensureTypingTicket(fromId, contextToken) {
   return typingTicketCache[fromId];
 }
 
+function extractUserTextForSummary(userContent) {
+  if (typeof userContent === "string") return userContent;
+  if (Array.isArray(userContent)) {
+    return userContent
+      .filter(block => block.type === "text")
+      .map(block => block.text)
+      .join("\n");
+  }
+  return String(userContent || "");
+}
+
+function extractAnchorAttachmentText(history) {
+  return "";
+}
+
+function normalizeAiUsage(usage = {}) {
+  return normalizeUsage(usage);
+}
+
 // AI 回复完整流程：正在输入 → 调 AI → 发送 → 停止输入 → 记入历史
 // pendingFilesForAnchor: 本轮处理过的文件列表，用于写入文件锚点
-async function sendAiReply(fromId, contextToken, userContent, pendingFilesForAnchor = null) {
+async function sendAiReply(fromId, contextToken, userContent, pendingFilesForAnchor = null, meta = {}) {
   const ticket = await ensureTypingTicket(fromId, contextToken);
 
   // status=1 显示"正在输入..."
@@ -524,8 +511,35 @@ async function sendAiReply(fromId, contextToken, userContent, pendingFilesForAnc
     }).catch(() => {});
   }
 
-  // 调用 AI（历史中已有旧文件锚点，新文件的锚点在 AI 回复后再写入）
+  // 调用 AI：文件和长期记忆先由秘书筛选，再由 context-builder 组装
   const history = getHistoryForUser(fromId);
+  if (pendingFilesForAnchor && pendingFilesForAnchor.length > 0) {
+    const updated = upsertFileContextAnchors(fileAnchors.get(fromId) || [], pendingFilesForAnchor);
+    fileAnchors.set(fromId, updated);
+  }
+  const allFiles = fileAnchors.get(fromId) || [];
+  const memoryEnabled = botConfig.memory?.enabled !== false;
+  const secretaryEnabled = botConfig.secretary?.enabled !== false;
+  const promptCacheEnabled = botConfig.prompt_cache?.enabled === true;
+  const memory = memoryEnabled ? loadMemory(fromId) : { profile: [], episodes: [] };
+  const routing = await selectContext({
+    userId: fromId,
+    userContent,
+    history,
+    memory,
+    files: allFiles,
+    config: botConfig,
+    enabled: secretaryEnabled,
+    debugLog,
+  });
+  lastRouting.set(fromId, routing);
+  const selectedProfile = (memory.profile || []).filter(item => routing.profileIds.includes(item.id));
+  const selectedEpisodes = (memory.episodes || []).filter(item => routing.episodeIds.includes(item.id));
+  const selectedFiles = selectFilesByIds(allFiles, routing.fileIds);
+  fileAnchors.set(fromId, ageFileAnchors(allFiles, routing.fileIds));
+  if (memoryEnabled && routing.profileIds.length > 0) {
+    saveMemory(fromId, touchProfile(memory, routing.profileIds));
+  }
   const contentLen = typeof userContent === "string"
     ? userContent.length
     : JSON.stringify(userContent).length;
@@ -535,20 +549,76 @@ async function sendAiReply(fromId, contextToken, userContent, pendingFilesForAnc
     const waitHint = `内容较大（约 ${kb} KB），回复需要较长时间，请耐心等待...`;
     await sendMsgSafe(fromId, contextToken, waitHint);
   }
-  const reply = await callAI(userContent, botConfig, history);
+  const request = buildRequest({
+    prompt: botConfig.prompt,
+    userContent,
+    history,
+    files: selectedFiles,
+    profile: selectedProfile,
+    episodes: selectedEpisodes,
+    promptCacheEnabled,
+    userId: fromId,
+  });
+  lastRequestMeta.set(fromId, request.meta);
+  console.log(`[上下文] user=${fromId} system=${request.meta.system_chars}字${request.meta.cached_blocks ? "(缓存)" : ""} 文件=${request.meta.file_count} 事件=${request.meta.episode_count} 历史=${request.meta.history_messages}条 ≈${request.meta.approx_tokens} token`);
+  debugLog({ event: "context_built", ...request.meta });
+  const aiResult = await callClaude({
+    system: request.system,
+    messages: request.messages,
+    config: botConfig,
+    cache: { enabled: promptCacheEnabled },
+    onLog: console.log,
+  });
+  const reply = aiResult.text;
+  const usage = normalizeAiUsage(aiResult.usage);
+  lastUsage.set(fromId, usage);
+  debugLog({
+    event: "claude_usage",
+    user: fromId,
+    input: usage.input_tokens,
+    output: usage.output_tokens,
+    cache_creation: usage.cache_creation_input_tokens,
+    cache_read: usage.cache_read_input_tokens,
+  });
   resetStatsIfNewDay();
   dailyStats.messageCount++;
+  dailyStats.inputTokens += usage.input_tokens;
+  dailyStats.outputTokens += usage.output_tokens;
   addToHistory(fromId, userContent, reply);
-
-  // AI 回复后再写入文件锚点，避免首轮消息中出现重复文件内容
-  if (pendingFilesForAnchor && pendingFilesForAnchor.length > 0) {
-    upsertFileAnchors(fromId, pendingFilesForAnchor);
-    console.log(`[文件锚点] 已写入 ${pendingFilesForAnchor.length} 个文件锚点，总字数=${pendingFilesForAnchor.reduce((s, f) => s + f.text.length, 0)}`);
-  }
 
   // 发送回复
   await sendMsgSafe(fromId, contextToken, reply);
   console.log(`\n╔══ AI 回复 ══════════════════════════════════\n${reply}\n──────────────────────────────────────────`);
+
+  const attachmentNames = meta.attachmentNames || pendingFilesForAnchor?.map(f => f.fileName) || [];
+  const currentAttachmentText = meta.attachmentText
+    ?? pendingFilesForAnchor?.map(f => `[${f.fileName}]\n${f.text}`).join("\n\n")
+    ?? "";
+  const anchorAttachmentText = extractAnchorAttachmentText(history);
+  recordChatTurn({
+    instanceName: meta.instanceName || process.cwd().split(/[\\/]/).pop(),
+    fromId,
+    messageId: meta.messageId,
+    timestamp: meta.timestamp || Date.now(),
+    userContent: meta.userContent || extractUserTextForSummary(userContent),
+    attachmentNames,
+    attachmentText: [currentAttachmentText, anchorAttachmentText].filter(Boolean).join("\n\n"),
+    aiReply: reply,
+    model: botConfig.model,
+    usage,
+  }).catch(e => {
+    console.log(`[飞书汇总] 记录聊天轮次失败: ${e.message}`);
+  });
+  extractAndSaveMemory({
+    userId: fromId,
+    userText: meta.userContent || extractUserTextForSummary(userContent),
+    aiReply: reply,
+    config: botConfig,
+    enabled: memoryEnabled,
+    debugLog,
+  }).catch(e => {
+    console.log(`[记忆] 异步抽取异常: ${e.message}`);
+  });
 
   // status=2 取消"正在输入..."
   if (isLocalId(fromId)) {
@@ -565,94 +635,55 @@ async function sendAiReply(fromId, contextToken, userContent, pendingFilesForAnc
 
 // ========== AI API 调用 ==========
 async function callAI(userContent, config, history = []) {
-  const headers = {
-    "Authorization": `Bearer ${config.api_key}`,
-    "content-type": "application/json",
-    "User-Agent": "claude-cli/2.0.76 (external, cli)",
-  };
+  const result = await callAIWithUsage(userContent, config, history);
+  return result.text;
+}
 
-  const userMessage = typeof userContent === "string"
-    ? { role: "user", content: userContent }
-    : { role: "user", content: userContent };
+async function callSummaryAI(userContent, config, history = []) {
+  const text = typeof userContent === "string"
+    ? userContent
+    : Array.isArray(userContent)
+      ? userContent.filter(b => b.type === "text").map(b => b.text).join("\n")
+      : String(userContent || "");
+  const messages = [
+    ...history.map(item => ({ role: item.role, content: item.content })),
+    { role: "user", content: text },
+  ];
+  const res = await fetch(`${config.base_url}/v1/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${config.api_key}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: config.model,
+      messages,
+      max_tokens: 512,
+      temperature: 0.2,
+    }),
+    signal: AbortSignal.timeout(60000),
+  });
 
-  const contentLen = typeof userContent === "string"
-    ? userContent.length
-    : JSON.stringify(userContent).length;
-
-  const payload = {
-    model: config.model,
-    max_tokens: 4096,
-    system: config.prompt,
-    messages: [...history, userMessage],
-  };
-
-  const url = `${config.base_url}/v1/messages`;
-  const retryDelays = [2, 4, 8, 16, 32]; // 秒
-  const maxRetries = 5;
-  let lastError;
-
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(180000),
-      });
-
-      if (!res.ok) {
-        const errBody = await res.text().catch(() => "(无法读取响应体)");
-        const diag = [];
-        for (const k of ["x-request-id", "content-type", "retry-after", "date", "x-should-retry", "x-ratelimit-reset-request"]) {
-          const v = res.headers.get(k);
-          if (v) diag.push(`${k}=${v}`);
-        }
-        console.log(`[AI] HTTP ${res.status} — ${diag.join(" ") || "无诊断头"}`);
-        console.log(`[AI] 响应体: ${errBody.slice(0, 2000)}`);
-        throw new Error(`HTTP ${res.status}`);
-      }
-
-      const data = await res.json();
-      const text = data.content?.[0]?.text;
-      if (!text) {
-        console.log(`[AI] 响应无文本，完整 JSON: ${JSON.stringify(data).slice(0, 2000)}`);
-        throw new Error("响应中未找到文本内容");
-      }
-
-      if (attempt > 0) {
-        console.log(`[AI] 第 ${attempt} 次重试成功: ${text.slice(0, 80)}...`);
-      }
-
-      if (data.usage) {
-        dailyStats.inputTokens += data.usage.input_tokens ?? data.usage.prompt_tokens ?? 0;
-        dailyStats.outputTokens += data.usage.output_tokens ?? data.usage.completion_tokens ?? 0;
-      }
-
-      return text;
-    } catch (e) {
-      lastError = e;
-      if (attempt < maxRetries) {
-        const delay = retryDelays[attempt];
-        console.log(`[AI] 第 ${attempt + 1} 次失败（${e.message}），${delay}s 后重试...`);
-        await sleep(delay * 1000);
-      }
-    }
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`summary HTTP ${res.status}: ${body.slice(0, 300)}`);
   }
 
-  // 最终失败 — 输出完整诊断信息
-  const errCode = lastError?.cause?.code || lastError?.code || "";
-  const errName = lastError?.name || "";
-  console.log(`[AI] 已重试 ${maxRetries} 次，最终失败:`);
-  console.log(`[AI]   URL: ${url}`);
-  console.log(`[AI]   Model: ${config.model}`);
-  console.log(`[AI]   消息长度: ${contentLen} 字符`);
-  console.log(`[AI]   错误名: ${errName}${errCode ? ", 底层码: " + errCode : ""}`);
-  console.log(`[AI]   错误信息: ${lastError?.message || "(无)"}`);
-  if (lastError?.cause?.message && lastError.cause.message !== lastError?.message) {
-    console.log(`[AI]   底层错误: ${lastError.cause.message}`);
-  }
+  const data = await res.json();
+  const choice = data.choices?.[0]?.message;
+  const summary = choice?.content || choice?.reasoning_content;
+  if (!summary) throw new Error("summary response has no content");
+  return summary;
+}
 
-  return "AI 接口暂时不可用，请稍后再试。";
+async function callAIWithUsage(userContent, config, history = []) {
+  const request = buildRequest({
+    prompt: config.prompt,
+    userContent,
+    history,
+    promptCacheEnabled: false,
+  });
+  return callClaude({ system: request.system, messages: request.messages, config, cache: { enabled: false } });
 }
 // =================================
 
@@ -1083,7 +1114,11 @@ async function messageLoop() {
         const oldestTs = Math.min(...allPending.map(f => f.timestamp));
         if (Date.now() - oldestTs > PENDING_FILE_TTL_MS) {
           console.log(`[文件] ${fromId} 的待处理文件已超时，丢弃 ${allPending.length} 个文件`);
-          await sendAiReply(fromId, contextToken, text);
+          await sendAiReply(fromId, contextToken, text, null, {
+            messageId: msg.message_id,
+            timestamp: Date.now(),
+            userContent: text,
+          });
         } else if (textFiles.length === 0 && imageFiles.length === 1) {
           // 单图片：走旧的 content blocks 路径
           const img = imageFiles[0];
@@ -1095,7 +1130,13 @@ async function messageLoop() {
             { type: "text", text: `[用户上传了: ${img.fileName}]\n${text}` }
           ];
           console.log(`\n╔══ 合并图片+用户要求（传给AI） ══════════════\n图片=${img.fileName} 要求=${text.slice(0, 100)}\n──────────────────────────────────────────`);
-          await sendAiReply(fromId, contextToken, content);
+          await sendAiReply(fromId, contextToken, content, null, {
+            messageId: msg.message_id,
+            timestamp: Date.now(),
+            userContent: text,
+            attachmentNames: [img.fileName],
+            attachmentText: "",
+          });
         } else {
           // 有文本文件（可能混合图片）：构建多文件合并消息
           let combined = "";
@@ -1123,15 +1164,31 @@ async function messageLoop() {
                 type: "image",
                 source: { type: "base64", media_type: img.mediaType, data: img.base64 }
               }))),
-              { type: "text", text: combined }
+              { type: "text", text }
             ];
-            await sendAiReply(fromId, contextToken, content, textFiles);
+            await sendAiReply(fromId, contextToken, content, textFiles, {
+              messageId: msg.message_id,
+              timestamp: Date.now(),
+              userContent: text,
+              attachmentNames: allPending.map(f => f.fileName),
+              attachmentText: textFiles.map(f => `[${f.fileName}]\n${f.text}`).join("\n\n"),
+            });
           } else {
-            await sendAiReply(fromId, contextToken, combined, textFiles);
+            await sendAiReply(fromId, contextToken, text, textFiles, {
+              messageId: msg.message_id,
+              timestamp: Date.now(),
+              userContent: text,
+              attachmentNames: textFiles.map(f => f.fileName),
+              attachmentText: textFiles.map(f => `[${f.fileName}]\n${f.text}`).join("\n\n"),
+            });
           }
         }
       } else {
-        await sendAiReply(fromId, contextToken, text);
+        await sendAiReply(fromId, contextToken, text, null, {
+          messageId: msg.message_id,
+          timestamp: Date.now(),
+          userContent: text,
+        });
       }
     }
   }
@@ -1148,6 +1205,18 @@ console.log(`
 
 // 0. 加载配置文件
 const botConfig = await loadOrCreateConfig();
+
+// 0.1 初始化飞书自动汇总（缺省禁用，配置不完整不会影响 bot 启动）
+initFeishuSummary(botConfig, {
+  cwd: process.cwd(),
+  callAI: callSummaryAI,
+  aiConfig: {
+    ...botConfig,
+    api_key: botConfig.summary_api_key || botConfig.router_api_key || botConfig.api_key,
+    base_url: botConfig.summary_base_url || botConfig.router_base_url || botConfig.base_url,
+    model: botConfig.feishu_summary?.summary_model || botConfig.router_model || botConfig.model,
+  },
+});
 
 // 0.1 初始化调度器模块
 initScheduler(botConfig, {
@@ -1184,6 +1253,7 @@ if (isLocalEnabled()) {
     snapshotForProbe: (userId) => snapshotForProbe(userId, {
       pendingFiles, fileAnchors, conversationHistory,
       typingTicketCache, dailyStats, welcomedUsers, lastContact,
+      lastRouting, lastRequestMeta, lastUsage,
     }),
     resetUser: (userId) => {
       pendingFiles.delete(userId);
@@ -1191,6 +1261,9 @@ if (isLocalEnabled()) {
       conversationHistory.delete(userId);
       typingTicketCache[userId] && delete typingTicketCache[userId];
       welcomedUsers.delete(userId);
+      lastRouting.delete(userId);
+      lastRequestMeta.delete(userId);
+      lastUsage.delete(userId);
     },
   });
   console.log(`[LOCAL] 测试通道已启用 :${process.env.LOCAL_TEST_PORT}`);

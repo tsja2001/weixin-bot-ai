@@ -1,8 +1,12 @@
 // local-channel/state-probe.js — 内部状态脱敏快照
+import { filesForProbe } from "../file-context.js";
+import { loadMemory } from "../memory/store.js";
+
 export function snapshotForProbe(userId, state) {
   const {
     pendingFiles, fileAnchors, conversationHistory,
     typingTicketCache, dailyStats, welcomedUsers, lastContact,
+    lastRouting, lastRequestMeta, lastUsage,
   } = state;
 
   const pendingEntry = pendingFiles.get(userId);
@@ -18,9 +22,7 @@ export function snapshotForProbe(userId, state) {
       age_ms: Date.now() - pendingEntry.timestamp,
     } : null,
     file_anchors: anchorEntry ? {
-      count: anchorEntry.length,
-      total_chars: anchorEntry.reduce((s, a) => s + (a.content ? a.content.length : 0), 0),
-      turns: anchorEntry.map(a => a.turnCount),
+      ...filesForProbe(anchorEntry),
     } : null,
     conversation_history: historyEntry ? {
       message_count: historyEntry.messages.length,
@@ -34,5 +36,9 @@ export function snapshotForProbe(userId, state) {
       output_tokens: dailyStats.outputTokens,
     },
     last_contact: lastContact.fromId === userId ? { from_id: lastContact.fromId } : null,
+    memory: loadMemory(userId),
+    last_routing: lastRouting?.get(userId) || null,
+    last_request: lastRequestMeta?.get(userId) || null,
+    last_usage: lastUsage?.get(userId) || null,
   };
 }

@@ -19,6 +19,10 @@ benchmarks/
 
 # 微信登录二维码
 qrcode.*
+lark-cli-auth.png
+/memory/*.json
+/memory/*.tmp
+instances/*/memory/
 
 # Python
 __pycache__/

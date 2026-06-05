@@ -44,3 +44,21 @@ export const COMMANDS_MSG = [
 
 // 默认提示词
 export const DEFAULT_PROMPT = "你是一个有帮助的AI助手，请用中文简洁地回复。字数尽量少一些";
+
+// ========== 长期记忆 ==========
+export const MEMORY_MAX_PROFILE = 50;
+export const MEMORY_MAX_EPISODES = 100;
+export const MEMORY_RECALL_MAX_EPISODES = 5;
+export const MEMORY_EPISODE_SUMMARY_CHARS = 40;
+
+// ========== 秘书（DeepSeek 上下文选择）==========
+export const SECRETARY_TIMEOUT_MS = 6000;
+export const SECRETARY_FILE_PREVIEW_CHARS = 300;
+export const FILE_IDLE_EVICT_TURNS = 6;
+
+// ========== Prompt Caching ==========
+export const CACHE_MIN_CHARS = 1500;
+
+// ========== 秘书/抽取请求 marker ==========
+export const SECRETARY_MARKER = "TASK:SELECT_CONTEXT";
+export const EXTRACT_MARKER = "TASK:EXTRACT_MEMORY";
